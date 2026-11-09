@@ -1,0 +1,38 @@
+# Derived data and large intermediates are never committed; see data/README.md
+*.rds
+*.RData
+*.rda
+*.faa
+*.fasta
+*.fastq
+*.fastq.gz
+*.mzML
+*.raw
+
+# Analysis outputs
+final_run/
+Results_v8/
+derived/
+session_*/
+output/
+figures_out/
+*_files/
+*_cache/
+
+# Knit artefacts
+*.html
+*.pdf
+*.log
+*.aux
+
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+renv/library/
+renv/staging/
+
+# OS
+.DS_Store
+Thumbs.db

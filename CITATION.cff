@@ -1,0 +1,86 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite both the software and the paper."
+title: "Analysis code for: Gut microbial gene abundance poorly predicts patient-specific protein output during checkpoint immunotherapy"
+abstract: >-
+  Analysis, figure and supplementary-analysis code for a two-centre study of
+  gut metagenomes and metaproteomes from melanoma patients treated with
+  anti-PD-1 and anti-CTLA-4 immune checkpoint blockade.
+type: software
+license: MIT
+authors:
+  - family-names: "Nissenbaum-Toren"
+    given-names: "Tal"
+  - family-names: "Brenner"
+    given-names: "Moran"
+  - family-names: "Rodrigues"
+    given-names: "Richard"
+  - family-names: "Shapira-Frommer"
+    given-names: "Ronnie"
+  - family-names: "Boursi"
+    given-names: "Ben"
+  - family-names: "Asher"
+    given-names: "Nethanel"
+  - family-names: "Lev-Ari"
+    given-names: "Shaked"
+  - family-names: "Wolf"
+    given-names: "Yochai"
+  - family-names: "Zarour"
+    given-names: "Hassane M."
+  - family-names: "Davar"
+    given-names: "Diwakar"
+  - family-names: "Trinchieri"
+    given-names: "Giorgio"
+  - family-names: "Lobel"
+    given-names: "Lior"
+    affiliation: "The Mina and Everard Goodman Faculty of Life Sciences, Bar-Ilan University, Ramat Gan, Israel"
+keywords:
+  - metaproteomics
+  - metagenomics
+  - gut microbiome
+  - immune checkpoint blockade
+  - melanoma
+version: "1.0.0"
+date-released: "2026-11-09"
+# repository-code and doi are filled in when the repository is created and the
+# Zenodo DOI is reserved. Zenodo reads this file, so leaving them out means the
+# archived record carries no link back here.
+repository-code: "https://github.com/liorlobel/icb-melanoma-metaproteomics"
+# doi: "10.5281/zenodo.XXXXXXX"
+identifiers:
+  - type: other
+    value: "PRJNA1558570"
+    description: "NCBI SRA BioProject — metagenomes"
+  - type: other
+    value: "PXD086916"
+    description: "PRIDE / ProteomeXchange — metaproteomes"
+# The `message` above asks for the paper to be cited too; this is the paper.
+# Journal, volume and DOI are added on acceptance.
+preferred-citation:
+  type: article
+  title: "Gut microbial gene abundance poorly predicts patient-specific protein output during checkpoint immunotherapy"
+  year: 2026
+  authors:
+    - family-names: "Nissenbaum-Toren"
+      given-names: "Tal"
+    - family-names: "Brenner"
+      given-names: "Moran"
+    - family-names: "Rodrigues"
+      given-names: "Richard"
+    - family-names: "Shapira-Frommer"
+      given-names: "Ronnie"
+    - family-names: "Boursi"
+      given-names: "Ben"
+    - family-names: "Asher"
+      given-names: "Nethanel"
+    - family-names: "Lev-Ari"
+      given-names: "Shaked"
+    - family-names: "Wolf"
+      given-names: "Yochai"
+    - family-names: "Zarour"
+      given-names: "Hassane M."
+    - family-names: "Davar"
+      given-names: "Diwakar"
+    - family-names: "Trinchieri"
+      given-names: "Giorgio"
+    - family-names: "Lobel"
+      given-names: "Lior"

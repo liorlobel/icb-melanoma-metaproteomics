@@ -1,0 +1,3005 @@
+---
+title: "ICB melanoma metagenomics — Sheba + Pitt"
+author: "Cleaned analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r knitr-opts, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 5, dpi = 150
+)
+```
+
+# 0. Setup
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(magrittr)
+library(microeco)
+library(file2meco)
+library(vegan)
+library(ape)
+library(maaslin3)
+library(ANCOMBC)
+library(MicrobiomeStat) # provides linda()
+library(phyloseq)
+library(patchwork)
+library(ggpubr)
+library(ggbeeswarm)
+library(ComplexHeatmap)
+library(circlize)
+
+set.seed(42)
+
+# ---- Paths: edit these to match your local layout -------------------------
+paths <- list(
+  sheba_metaphlan      = here::here("Data_for_combined_Sheba_Pitt_metagenomics/Sheba/merged_abundance_table_combined_analysis_sheba.txt"),
+  sheba_metadata       = here::here("Data_for_combined_Sheba_Pitt_metagenomics/Sheba/metadata_sheba.tsv"),
+  sheba_match          = here::here("Data_for_combined_Sheba_Pitt_metagenomics/Sheba/match_sample_table_combined_sheba.txt"),
+  sheba_humann         = here::here("Data_for_combined_Sheba_Pitt_metagenomics/Sheba/pathabundance_merged_relab_unstratified.tsv"),
+
+  pitt_metaphlan       = here::here("Data_for_combined_Sheba_Pitt_metagenomics/pitt/merged_metaphlan_profile.txt"),
+  pitt_metadata        = here::here("Data_for_combined_Sheba_Pitt_metagenomics/pitt/metadata_pitt.tsv"),
+  pitt_humann          = here::here("Data_for_combined_Sheba_Pitt_metagenomics/pitt/merged_pittsburgh_pathabunance.tsv"),
+
+  out_dir              = here::here("Results_for_combined_Sheba_Pitt/metagenomics")
+)
+dir.create(paths$out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Analysis parameters ---------------------------------------------------
+PARAMS <- list(
+  prevalence_threshold = 0.10,   # taxon must appear in ≥10% samples
+  abundance_threshold  = 1e-4,   # ≥0.01% relative abundance
+  q_value_threshold    = 0.10,   # MaAsLin3 / ANCOM-BC2 / LinDA significance
+  alpha_div_methods    = c("Observed", "Shannon", "Simpson"),
+  beta_div_method      = "aitchison", # primary; CLR-Euclidean (Aitchison) 
+  beta_div_sensitivity = "bray", # sensetivity
+  permanova_perms      = 999,
+  primary_factor       = "Response",
+  cohort_factor        = "Cohort",
+  time_filter          = "Pre"   # baseline samples only
+)
+```
+
+# 1. Load metadata
+
+The metadata files are pre-harmonized with rich clinical covariates:
+
+- **Common to both cohorts**: `Response`, `Patient`, `Treatment_regimen`,
+  `Protocol`, `Rx_start`, `Sample_date`, `Sample_days_pre`, `Line`
+- **Sheba-only**: `Response_RECIST` (Complete/Partial/Disease progression/clinical progression),
+  `Response_subtype_raw`, `Patient_DB`
+- **Pitt-only**: `Pitts_subcohort`, `Sequencing_Batch`, `Sex`, `Stage`,
+  `Histology`, `PPI_H2RA`, `Abx_3M_prior`, `irAE`, `Prog_Event`, `Death_event`,
+  `Timepoint_days`, `Timepoint_discrete`
+
+```{r load-metadata}
+load_meta <- function(path) {
+  m <- read.table(path, sep = "\t", header = TRUE, stringsAsFactors = FALSE,
+                  na.strings = c("NA", ""))
+  # Core
+  m$Response          <- factor(m$Response, levels = c("Non_responder", "Responder"))
+  m$Cohort            <- factor(m$Cohort,   levels = c("Sheba", "Pitt"))
+  m$Time_point        <- factor(m$Time_point)
+  m$Treatment_regimen <- factor(m$Treatment_regimen,
+                                levels = c("anti-PD1", "anti-PD1+anti-CTLA4"))
+  # Coerce remaining factor-like columns where present
+  for (col in c("Response_RECIST", "Response_subtype_raw", "Source",
+                "Pitts_subcohort", "Sequencing_Batch", "Sex", "Stage",
+                "Histology", "PPI_H2RA", "Abx_3M_prior", "irAE",
+                "Timepoint_discrete", "Sample_progression_timepoint")) {
+    if (col %in% colnames(m)) m[[col]] <- factor(m[[col]])
+  }
+  # Numeric
+  for (col in c("Sample_days_pre", "Timepoint_days", "Line")) {
+    if (col %in% colnames(m)) m[[col]] <- as.numeric(m[[col]])
+  }
+  m <- m %>% filter(!is.na(Response))
+  rownames(m) <- m$SampleID
+  m
+}
+
+meta_sheba <- load_meta(paths$sheba_metadata)
+meta_pitt  <- load_meta(paths$pitt_metadata)
+
+# In load_meta or a follow-up cleanup
+meta_pitt$PPI_H2RA <- as.character(meta_pitt$PPI_H2RA)
+bad <- !meta_pitt$PPI_H2RA %in% c("0", "1", NA)
+table(bad, useNA = "ifany")          # confirm just the one
+meta_pitt$PPI_H2RA[bad] <- NA        # or recode if you can recover the intent
+meta_pitt$PPI_H2RA <- factor(meta_pitt$PPI_H2RA, levels = c("0", "1"))
+
+cat("Sheba: ", nrow(meta_sheba), " samples / ",
+    length(unique(meta_sheba$Patient)), " patients\n", sep = "")
+print(table(meta_sheba$Response, meta_sheba$Treatment_regimen, useNA = "ifany"))
+
+cat("\nPitt: ", nrow(meta_pitt), " samples / ",
+    length(unique(meta_pitt$Patient)), " patients\n", sep = "")
+print(table(meta_pitt$Response, meta_pitt$Treatment_regimen, useNA = "ifany"))
+print(table(meta_pitt$Sequencing_Batch, meta_pitt$Response, useNA = "ifany"))
+```
+
+# 2. Build microtable objects
+
+For Sheba we need to average the p96A and p96B technical-replicate columns
+into a single `p96_avg` column before building the microtable. The
+`average_replicates()` helper does this on the raw MetaPhlAn TSV; the
+metadata already has a single `p96_avg` row so the IDs will match up.
+
+```{r build-meco}
+# ---- Helpers -----------------------------------------------------------------
+
+average_replicates <- function(feature_path, replicate_groups) {
+  raw <- read.table(feature_path, header = TRUE, sep = "\t", row.names = 1,
+                    check.names = FALSE, comment.char = "", quote = "",
+                    stringsAsFactors = FALSE)
+
+  for (new_id in names(replicate_groups)) {
+    cols <- intersect(replicate_groups[[new_id]], colnames(raw))
+    if (length(cols) < 2) {
+      warning(sprintf("Skipping %s: only %d of %d replicate columns found",
+                      new_id, length(cols), length(replicate_groups[[new_id]])))
+      next
+    }
+    raw[[new_id]] <- rowMeans(raw[, cols, drop = FALSE], na.rm = TRUE)
+    raw <- raw[, setdiff(colnames(raw), cols), drop = FALSE]
+    message(sprintf("Averaged %s -> %s", paste(cols, collapse = " + "), new_id))
+  }
+
+  tf <- tempfile(fileext = ".tsv")
+  out <- cbind(clade_name = rownames(raw), raw)
+  write.table(out, tf, sep = "\t", row.names = FALSE, quote = FALSE)
+  tf
+}
+
+strip_mpa_header <- function(path) {
+  lines <- readLines(path, warn = FALSE)
+  n_skip <- 0L
+  while (n_skip < length(lines) && startsWith(lines[n_skip + 1L], "#")) {
+    n_skip <- n_skip + 1L
+  }
+  if (n_skip == 0L) return(path)
+  tf <- tempfile(fileext = ".tsv")
+  writeLines(lines[-seq_len(n_skip)], tf)
+  message(sprintf("Stripped %d header comment line(s) from %s",
+                  n_skip, basename(path)))
+  tf
+}
+
+# Reconcile a match_table after columns have been averaged. Drops rows whose
+# feature-table-side name (column 1) was averaged away, then adds an
+# identity row (new_id -> new_id) for each merged column so mpa2meco can
+# find it. Assumes match_table convention: col1 = feature-table sample name,
+# col2 = sample_table SampleID.
+update_match_table <- function(mt, replicate_groups) {
+  removed <- unlist(replicate_groups, use.names = FALSE)
+  mt <- mt[!mt[[1]] %in% removed, , drop = FALSE]
+  add <- data.frame(V1 = names(replicate_groups),
+                    V2 = names(replicate_groups),
+                    stringsAsFactors = FALSE)
+  names(add) <- names(mt)
+  rbind(mt, add)
+}
+
+build_meco <- function(metaphlan_path, metadata, match_table = NULL,
+                       replicate_groups = NULL,
+                       strip_col_prefix = NULL) {
+  if (!is.null(replicate_groups)) {
+    metaphlan_path <- average_replicates(metaphlan_path, replicate_groups)
+  }
+  metaphlan_path <- strip_mpa_header(metaphlan_path)
+
+  # Optionally strip a fixed prefix from feature-table column names so they
+  # match metadata SampleIDs (e.g. Pitt's "trimmed_" pipeline prefix).
+  if (!is.null(strip_col_prefix)) {
+    raw <- read.table(metaphlan_path, header = TRUE, sep = "\t", row.names = 1,
+                      check.names = FALSE, comment.char = "", quote = "",
+                      stringsAsFactors = FALSE)
+    new_cn <- sub(paste0("^", strip_col_prefix), "", colnames(raw))
+    if (anyDuplicated(new_cn)) {
+      stop("Stripping prefix '", strip_col_prefix,
+           "' produces duplicate column names.")
+    }
+    colnames(raw) <- new_cn
+    tf <- tempfile(fileext = ".tsv")
+    out <- cbind(clade_name = rownames(raw), raw)
+    write.table(out, tf, sep = "\t", row.names = FALSE, quote = FALSE)
+    metaphlan_path <- tf
+    message(sprintf("Stripped prefix '%s' from %d feature-table columns",
+                    strip_col_prefix, length(new_cn)))
+  }
+
+  args <- list(feature_table = metaphlan_path, sample_table = metadata)
+  if (!is.null(match_table)) {
+    mt <- read.table(match_table, header = FALSE, stringsAsFactors = FALSE)
+    if (!is.null(replicate_groups)) mt <- update_match_table(mt, replicate_groups)
+    args$match_table <- mt
+  }
+  m <- do.call(file2meco::mpa2meco, args)
+  m$tidy_dataset()
+  m
+}
+
+# ---- Build microtables -------------------------------------------------------
+
+sheba <- build_meco(
+  paths$sheba_metaphlan, meta_sheba, paths$sheba_match,
+  replicate_groups = list(
+    p96_avg = c(
+      "p96_ME_filtered_R1_kneaddata_paired_1.metaphlan",
+      "p96_S2_merged_filtered_R1_kneaddata_paired_1.metaphlan"
+    )
+  )
+)
+
+pitt <- build_meco(paths$pitt_metaphlan, meta_pitt,
+                   strip_col_prefix = "trimmed_")
+
+cat("Sheba microtable: ", nrow(sheba$otu_table), " taxa x ",
+    ncol(sheba$otu_table), " samples\n", sep = "")
+cat("Pitt  microtable: ", nrow(pitt$otu_table),  " taxa x ",
+    ncol(pitt$otu_table),  " samples\n", sep = "")
+```
+
+# 3. Filtering
+
+We apply the same filters to both cohorts: kingdom restriction, pollution
+removal, prevalence ≥ 10 %, abundance ≥ 1e-4. Pre-filtering is essential
+before differential abundance — keeping rare taxa inflates the multiple
+testing burden and destabilizes ANCOM-BC and LinDA fits.
+
+```{r filter-meco}
+filter_meco <- function(m, min_prev = PARAMS$prevalence_threshold,
+                          min_abund = PARAMS$abundance_threshold,
+                          time_pt   = NULL) {
+  # Kingdom filter (handles both "Bacteria" and "k__Bacteria" prefixes)
+  king <- m$tax_table$Kingdom
+  is_microbe <- str_detect(king, "Bacteria|Archaea")
+  m$tax_table <- m$tax_table[is_microbe, , drop = FALSE]
+  m$filter_pollution(taxa = c("mitochondria", "chloroplast"))
+
+  # Drop NA / unclassified at the genus level
+  m$tax_table <- m$tax_table[!is.na(m$tax_table$Genus) & m$tax_table$Genus != "g__", ]
+
+  # Optional time-point filter
+  if (!is.null(time_pt) && time_pt %in% levels(m$sample_table$Time_point)) {
+    m$sample_table <- m$sample_table[m$sample_table$Time_point == time_pt, ]
+  }
+
+  m$tidy_dataset()
+
+  # Prevalence + abundance filter at OTU level
+  prev <- rowSums(m$otu_table > min_abund) / ncol(m$otu_table)
+  keep <- rownames(m$otu_table)[prev >= min_prev]
+  m$otu_table <- m$otu_table[keep, , drop = FALSE]
+  m$tidy_dataset()
+
+  m
+}
+
+# ---- QC exclusion: samples with > 25% UNCLASSIFIED MetaPhlAn reads -----------
+# Pre-registered, response-blind threshold. Identifies samples with sparse
+# taxonomic profiling that bias toward dominance by well-characterized taxa.
+
+PARAMS$qc_unclassified_threshold <- 25  # percent
+
+# Compute per-sample UNCLASSIFIED percentage from the raw MetaPhlAn output
+qc_unclassified_pcts <- function(metaphlan_path, sample_id_map = NULL,
+                                  strip_col_prefix = NULL) {
+  raw <- read.table(strip_mpa_header(metaphlan_path),
+                    header = TRUE, sep = "\t", row.names = 1,
+                    check.names = FALSE, comment.char = "", quote = "")
+  if (!"UNCLASSIFIED" %in% rownames(raw)) {
+    warning("UNCLASSIFIED row not found in ", basename(metaphlan_path))
+    return(setNames(numeric(0), character(0)))
+  }
+  pct <- as.numeric(raw["UNCLASSIFIED", ])
+  names(pct) <- colnames(raw)
+  if (!is.null(strip_col_prefix)) {
+    names(pct) <- sub(paste0("^", strip_col_prefix), "", names(pct))
+  }
+  if (!is.null(sample_id_map)) {
+    # sample_id_map: 2-col data.frame, col1 = feature-table name, col2 = SampleID
+    m <- setNames(sample_id_map[[2]], sample_id_map[[1]])
+    short <- m[names(pct)]
+    keep  <- !is.na(short)
+    pct <- setNames(pct[keep], short[keep])
+  }
+  pct
+}
+
+# Sheba uses a match table to map long names -> short patient IDs
+sheba_match_df  <- read.table(paths$sheba_match, header = FALSE,
+                              stringsAsFactors = FALSE)
+sheba_unclass   <- qc_unclassified_pcts(paths$sheba_metaphlan,
+                                         sample_id_map = sheba_match_df)
+pitt_unclass    <- qc_unclassified_pcts(paths$pitt_metaphlan,
+                                         strip_col_prefix = "trimmed_")
+
+sheba_flagged <- names(sheba_unclass)[sheba_unclass >
+                                        PARAMS$qc_unclassified_threshold]
+pitt_flagged  <- names(pitt_unclass)[pitt_unclass  >
+                                        PARAMS$qc_unclassified_threshold]
+
+cat("QC-flagged samples (UNCLASSIFIED >",
+    PARAMS$qc_unclassified_threshold, "%):\n")
+cat("  Sheba: ", paste(sheba_flagged, collapse = ", "), "\n")
+cat("  Pitt:  ", paste(pitt_flagged,  collapse = ", "), "\n")
+
+# ---- Build standard-filtered microtables (no QC exclusion) -------------------
+
+sheba_f <- filter_meco(sheba)
+pitt_f  <- filter_meco(pitt)
+
+cat("\nAfter standard filtering:\n",
+    "  Sheba: ", nrow(sheba_f$otu_table), " taxa x ",
+                 ncol(sheba_f$otu_table), " samples\n",
+    "  Pitt:  ", nrow(pitt_f$otu_table),  " taxa x ",
+                 ncol(pitt_f$otu_table),  " samples\n", sep = "")
+
+# ---- Build QC-passed microtables (PRIMARY for downstream analysis) -----------
+
+make_qc_subset <- function(m, drop_samples) {
+  m2 <- m$clone()
+  keep <- setdiff(colnames(m2$otu_table), drop_samples)
+  m2$sample_table <- m2$sample_table[keep, , drop = FALSE]
+  m2$tidy_dataset()
+  m2
+}
+
+sheba_qc <- make_qc_subset(sheba_f, sheba_flagged)
+pitt_qc  <- make_qc_subset(pitt_f,  pitt_flagged)
+
+cat("\nAfter QC exclusion (>", PARAMS$qc_unclassified_threshold,
+    "% UNCLASSIFIED):\n", sep = "")
+cat("  Sheba: ", ncol(sheba_qc$otu_table), " samples (was ",
+                 ncol(sheba_f$otu_table),  ")\n",
+    "  Pitt:  ", ncol(pitt_qc$otu_table),  " samples (was ",
+                 ncol(pitt_f$otu_table),   ")\n", sep = "")
+
+# ---- Sanity checks: confirm no covariate imbalance ---------------------------
+
+cat("\nSheba (QC) Response x Treatment_regimen:\n")
+print(table(sheba_qc$sample_table$Response,
+            sheba_qc$sample_table$Treatment_regimen))
+cat("\nPitt (QC) Response x Sequencing_Batch:\n")
+print(table(pitt_qc$sample_table$Response,
+            pitt_qc$sample_table$Sequencing_Batch))
+```
+
+# 4. Composition plots
+
+Reused helper for both cohorts.
+
+```{r composition}
+library(scales)
+
+# ---- Build a unified long-format data frame for both cohorts ----------------
+
+prepare_genus_long <- function(m, cohort_label, top_genera) {
+  ga <- as.data.frame(m$taxa_abund$Genus)
+
+  # Collapse duplicate-lineage genus rows: extract the bare genus name
+  # (last "|"-separated field) and sum abundances across any duplicates.
+  bare <- sub(".*\\|", "", rownames(ga))
+  ga$genus_bare <- bare
+  ga <- ga %>%
+    group_by(genus_bare) %>%
+    summarise(across(everything(), sum), .groups = "drop") %>%
+    as.data.frame()
+  rownames(ga) <- ga$genus_bare
+  ga$genus_bare <- NULL
+
+  # Per-sample renormalize to 100%
+  ga <- sweep(ga, 2, colSums(ga), "/") * 100
+
+  ga$Genus_disp <- ifelse(rownames(ga) %in% top_genera, rownames(ga), "Other")
+  ga <- ga %>%
+    pivot_longer(-Genus_disp, names_to = "SampleID", values_to = "Abundance") %>%
+    group_by(Genus_disp, SampleID) %>%
+    summarise(Abundance = sum(Abundance), .groups = "drop")
+
+  ga$Genus_disp <- sub("^g__", "", ga$Genus_disp)
+
+  meta <- as.data.frame(m$sample_table)
+  if (!"SampleID" %in% colnames(meta)) meta$SampleID <- rownames(meta)
+  meta <- meta[, c("SampleID", "Response")]
+
+  ga <- left_join(ga, meta, by = "SampleID")
+  ga$Cohort <- cohort_label
+  ga
+}
+
+top_n_shared <- function(m_sheba, m_pitt, n = 15) {
+  collapse_to_genus <- function(tab) {
+    df <- as.data.frame(tab)
+    df$g <- sub(".*\\|", "", rownames(df))
+    df %>% group_by(g) %>% summarise(across(everything(), sum), .groups = "drop") %>%
+      column_to_rownames("g")
+  }
+  s <- collapse_to_genus(m_sheba$taxa_abund$Genus)
+  p <- collapse_to_genus(m_pitt$taxa_abund$Genus)
+
+  s_norm <- sweep(s, 2, colSums(s), "/")
+  p_norm <- sweep(p, 2, colSums(p), "/")
+  s_mean <- rowMeans(s_norm)
+  p_mean <- rowMeans(p_norm)
+  all_g  <- union(names(s_mean), names(p_mean))
+  combined <- (
+    ifelse(all_g %in% names(s_mean), s_mean[all_g], 0) +
+    ifelse(all_g %in% names(p_mean), p_mean[all_g], 0)
+  ) / 2
+  names(combined) <- all_g
+  names(sort(combined, decreasing = TRUE))[seq_len(n)]
+}
+
+top_genera <- top_n_shared(sheba_qc, pitt_qc, n = 15)
+
+# ---- Build combined long-format data frame ----------------------------------
+
+df_long <- bind_rows(
+  prepare_genus_long(sheba_qc, "Sheba", top_genera),
+  prepare_genus_long(pitt_qc,  "Pitt",  top_genera)
+)
+
+# Order genera: top genera first (by overall abundance), "Other" last
+genus_levels <- c(sub("^g__", "", top_genera), "Other")
+df_long$Genus_disp <- factor(df_long$Genus_disp, levels = genus_levels)
+df_long$Cohort     <- factor(df_long$Cohort, levels = c("Sheba", "Pitt"))
+
+# order by dominant *named* genus (excluding "Other"), then by abundance
+#    of that genus. Samples with no named genus dominance fall to the end.
+# Build the sample order, panel by panel
+named_dominant <- df_long %>%
+  filter(Genus_disp != "Other") %>%
+  group_by(SampleID) %>%
+  slice_max(Abundance, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(SampleID, top_genus = Genus_disp, top_abund = Abundance)
+
+library(patchwork)
+
+panel_plot <- function(df_long, cohort_value, response_value, palette,
+                       show_y_axis = TRUE) {
+  d <- df_long %>%
+    filter(Cohort == cohort_value, Response == response_value) %>%
+    mutate(SampleID = factor(SampleID, levels = unique(SampleID)))
+
+  ggplot(d, aes(x = SampleID, y = Abundance, fill = Genus_disp)) +
+    geom_col(width = 1) +
+    scale_fill_manual(values = palette, name = "Genus", drop = FALSE) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 100),
+                       labels = function(x) paste0(x, "%")) +
+    labs(x = NULL,
+         y = if (show_y_axis) "Relative abundance (%)" else NULL,
+         title = paste0(cohort_value, " — ", response_value,
+                        " (n=", length(unique(d$SampleID)), ")")) + 
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x        = element_blank(),
+      axis.ticks.x       = element_blank(),
+      axis.text.y        = if (show_y_axis) element_text() else element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      plot.title         = element_text(size = 10, hjust = 0.5),
+      legend.text        = element_text(face = "italic"),
+      legend.key.size    = unit(0.8, "lines") 
+    )
+}
+
+# Sort each panel's samples by dominant named genus, then by abundance
+df_long <- df_long %>%
+  group_by(SampleID) %>%
+  mutate(top_named = {
+    nz <- Abundance[Genus_disp != "Other"]
+    g  <- Genus_disp[Genus_disp != "Other"]
+    if (length(nz) == 0) "zzz_other" else as.character(g[which.max(nz)])
+  },
+  top_named_abund = max(Abundance[Genus_disp != "Other"], na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Cohort, Response, top_named, desc(top_named_abund))
+
+# Build genus palette: distinct hues for the named top-N genera, neutral grey
+# for the "Other" catch-all. Sized dynamically to length(genus_levels) so this
+# survives changes to the top_genera count upstream.
+named_levels  <- genus_levels[genus_levels != "Other"]
+named_colors  <- scales::hue_pal(l = 60, c = 80)(length(named_levels))
+genus_palette <- c(setNames(named_colors, named_levels),
+                   Other = "grey80")
+
+# Build each panel
+p_sn <- panel_plot(df_long, "Sheba", "Non_responder", genus_palette, TRUE)
+p_sr <- panel_plot(df_long, "Sheba", "Responder",     genus_palette, FALSE)
+p_pn <- panel_plot(df_long, "Pitt",  "Non_responder", genus_palette, TRUE)
+p_pr <- panel_plot(df_long, "Pitt",  "Responder",     genus_palette, FALSE)
+
+# Assemble: use sample counts as relative widths so bar widths are equal
+n_sn <- sum(df_long$Cohort == "Sheba" & df_long$Response == "Non_responder" &
+            df_long$Genus_disp == "Other")
+n_sr <- sum(df_long$Cohort == "Sheba" & df_long$Response == "Responder" &
+            df_long$Genus_disp == "Other")
+n_pn <- sum(df_long$Cohort == "Pitt"  & df_long$Response == "Non_responder" &
+            df_long$Genus_disp == "Other")
+n_pr <- sum(df_long$Cohort == "Pitt"  & df_long$Response == "Responder" &
+            df_long$Genus_disp == "Other")
+
+p_composition <-
+  ((p_sn + p_sr + plot_layout(widths = c(n_sn, n_sr))) /
+   (p_pn + p_pr + plot_layout(widths = c(n_pn, n_pr)))) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+ggsave(file.path(paths$out_dir, "top15_genera_combined.svg"), p_composition,
+       width = 12, height = 6)
+ggsave(file.path(paths$out_dir, "top15_genera_combined.png"), p_composition,
+       width = 12, height = 6, dpi = 200)
+
+p_composition
+```
+
+# 5. Alpha diversity
+
+Per-cohort tests are non-parametric (Wilcoxon) since *N* per group is small.
+For the combined analysis (Section 11) we adjust for cohort with a linear
+model.
+
+```{r alpha-div}
+calc_alpha <- function(m) {
+  m$cal_alphadiv(measures = NULL)
+
+  ad <- as.data.frame(m$alpha_diversity)
+  if (!"SampleID" %in% colnames(ad)) ad$SampleID <- rownames(ad)
+
+  sm <- as.data.frame(m$sample_table)
+  if (!"SampleID" %in% colnames(sm)) sm$SampleID <- rownames(sm)
+
+  left_join(
+    ad,
+    sm[, c("SampleID", "Response", "Cohort", "Time_point")],
+    by = "SampleID"
+  )
+}
+
+alpha_sheba <- calc_alpha(sheba_qc)
+alpha_pitt  <- calc_alpha(pitt_qc)
+alpha_all   <- bind_rows(alpha_sheba, alpha_pitt)
+
+# Diagnostic: what indices actually got computed?
+cat("Available alpha indices:\n")
+print(setdiff(colnames(alpha_all),
+              c("SampleID", "Response", "Cohort", "Time_point")))
+
+# Adjust the pivot to whatever's actually present
+alpha_metrics <- intersect(c("Shannon", "Simpson", "InvSimpson", "Coverage"),
+                           colnames(alpha_all))
+alpha_long <- alpha_all %>%
+  pivot_longer(any_of(alpha_metrics),
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(Metric, levels = alpha_metrics))
+
+alpha_sheba <- calc_alpha(sheba_qc)
+alpha_pitt  <- calc_alpha(pitt_qc)
+alpha_all   <- bind_rows(alpha_sheba, alpha_pitt)
+
+alpha_long <- alpha_all %>%
+  pivot_longer(any_of(c("Observed", "Shannon", "Simpson")),
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(Metric, levels = c("Observed", "Shannon", "Simpson")))
+
+
+# Wilcoxon per cohort per metric
+alpha_tests <- alpha_long %>%
+  group_by(Cohort, Metric) %>%
+  summarise(p = wilcox.test(Value ~ Response)$p.value, .groups = "drop")
+print(alpha_tests)
+
+p_alpha <- ggplot(alpha_long, aes(Response, Value, fill = Response)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_quasirandom(width = 0.2, size = 1.5, alpha = 0.6) +
+  facet_grid(Metric ~ Cohort, scales = "free_y") +
+  scale_fill_manual(values = c("Non_responder" = "#ff7f00",
+                               "Responder"     = "#6a3d9a")) +
+  theme_bw(base_size = 12) +
+  labs(x = NULL, y = "Alpha diversity")
+
+p_alpha
+ggsave(file.path(paths$out_dir, "alpha_diversity_combined.svg"), p_alpha,
+       width = 7, height = 7)
+
+saveRDS(alpha_all, file.path(paths$out_dir, "alpha_div.rds"))
+```
+
+# 6. Beta diversity per cohort
+
+Bray–Curtis as primary; the same workflow gives Aitchison if you call
+`cal_betadiv(method = "aitchison")` instead. We always report PERMANOVA +
+PERMDISP — a significant PERMDISP means location differences in the PCoA
+might actually reflect dispersion differences.
+
+```{r beta-div-per-cohort}
+beta_one_cohort <- function(m, group = "Response", measure = "bray") {
+  m$cal_betadiv(method = measure, unifrac = FALSE)
+  tb <- trans_beta$new(dataset = m, group = group, measure = measure)
+  tb$cal_ordination(method = "PCoA")
+  tb$cal_manova(manova_all = FALSE, permutations = PARAMS$permanova_perms)
+  tb$cal_betadisper()
+  tb
+}
+
+beta_sheba <- beta_one_cohort(sheba_f)
+beta_pitt  <- beta_one_cohort(pitt_f)
+
+cat("Sheba PERMANOVA (Response, Bray-Curtis):\n");  print(beta_sheba$res_manova)
+cat("Sheba betadisper:\n");                         print(beta_sheba$res_betadisper)
+cat("Pitt  PERMANOVA (Response, Bray-Curtis):\n");  print(beta_pitt$res_manova)
+cat("Pitt  betadisper:\n");                         print(beta_pitt$res_betadisper)
+
+plot_pcoa <- function(tb, title) {
+  tb$plot_ordination(plot_color = "Response",
+                     plot_type = c("point", "ellipse"),
+                     color_values = c("Non_responder" = "#ff7f00",
+                                      "Responder"     = "#6a3d9a")) +
+    labs(title = title)
+}
+
+p_beta <- plot_pcoa(beta_sheba, "Sheba") | plot_pcoa(beta_pitt, "Pitt")
+p_beta
+ggsave(file.path(paths$out_dir, "beta_diversity_per_cohort.svg"),
+       p_beta, width = 11, height = 5)
+
+alpha_combo <- alpha_all   # already has Cohort
+for (metric in c("Shannon", "Simpson")) {
+  fit <- lm(as.formula(paste(metric, "~ Response + Cohort")), data = alpha_combo)
+  cat("\n--- ", metric, " ---\n")
+  print(summary(fit)$coefficients)
+}
+
+
+# Sensitivity-analysis sample list, decided NOW (not after seeing DA results)
+extreme_dominance_samples <- c("MF1221_S67", "MF1597_S5")
+
+
+library(ape)
+
+# Recompute the Pitt PCoA (Bray-Curtis on relative abundance)
+ab_pitt <- t(pitt_qc$otu_table)
+d_pitt  <- vegdist(ab_pitt, method = "bray")
+ord_pitt <- pcoa(d_pitt)
+eig_pitt <- 100 * ord_pitt$values$Relative_eig
+
+# Build plotting data frame
+pitt_pcoa_data <- data.frame(
+  PC1      = ord_pitt$vectors[, 1],
+  PC2      = ord_pitt$vectors[, 2],
+  SampleID = rownames(ord_pitt$vectors)
+)
+
+meta_for_join <- as.data.frame(pitt_qc$sample_table)
+if (!"SampleID" %in% colnames(meta_for_join)) {
+  meta_for_join$SampleID <- rownames(meta_for_join)
+}
+
+pitt_pcoa_data <- left_join(
+  pitt_pcoa_data,
+  meta_for_join[, c("SampleID", "Sequencing_Batch")],
+  by = "SampleID"
+)
+
+p_pitt_batch <- ggplot(pitt_pcoa_data,
+                       aes(PC1, PC2, color = Sequencing_Batch)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(type = "t", level = 0.8) +
+  scale_color_manual(values = c("August2024" = "#e41a1c",
+                                "GTSH10"     = "#377eb8",
+                                "GTSH14"     = "#4daf4a")) +
+  labs(x = sprintf("PCo1 (%.1f%%)", eig_pitt[1]),
+       y = sprintf("PCo2 (%.1f%%)", eig_pitt[2]),
+       title = "Pitt — colored by Sequencing_Batch") +
+  theme_bw(base_size = 12)
+
+p_pitt_batch
+ggsave(file.path(paths$out_dir, "pcoa_pitt_by_batch.svg"),
+       p_pitt_batch, width = 7, height = 5)
+
+
+```
+
+# 7. Differential abundance — primary (MaAsLin3) per cohort
+
+`min_abundance` and `min_prevalence` mirror the upstream filter so MaAsLin3
+isn't doing additional invisible filtering. `q-value` correction is the
+default; we use BH for consistency with downstream comparisons.
+
+```{r maaslin3-per-cohort}
+run_maaslin3_v4 <- function(m, output_dir, fixed_effects, reference,
+                             drop_placeholder_genera = TRUE) {
+  ga <- as.data.frame(m$taxa_abund$Genus)
+  bare <- sub(".*\\|", "", rownames(ga))
+  ga$g <- bare
+  ga <- ga %>% group_by(g) %>%
+    summarise(across(everything(), sum), .groups = "drop") %>%
+    as.data.frame()
+  rownames(ga) <- ga$g; ga$g <- NULL
+  if (drop_placeholder_genera) {
+    ga <- ga[!grepl("^g__GGB|^g__FGB|^g__OFGB|^g__CFGB", rownames(ga)), ]
+  }
+  # Drop all-zero columns explicitly
+  abund <- as.data.frame(t(as.matrix(ga)))
+  abund <- abund[, colSums(abund) > 0, drop = FALSE]
+
+  # Subset metadata to only the columns the model uses
+  metad <- as.data.frame(m$sample_table)
+  metad <- metad[, fixed_effects, drop = FALSE]
+  for (col in fixed_effects) {
+    if (is.factor(metad[[col]])) metad[[col]] <- droplevels(metad[[col]])
+  }
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  maaslin3::maaslin3(
+    input_data       = abund,
+    input_metadata   = metad,
+    output           = output_dir,
+    fixed_effects    = fixed_effects,
+    reference        = reference,
+    normalization    = "TSS",
+    transform        = "LOG",
+    correction       = "BH",
+    min_abundance    = PARAMS$abundance_threshold,
+    min_prevalence   = PARAMS$prevalence_threshold,
+    max_significance = PARAMS$q_value_threshold,
+    cores            = 2,
+    plot_summary_plot = FALSE,
+    plot_associations = FALSE
+  )
+}
+
+m3_pitt <- run_maaslin3_v4(
+  pitt_qc,
+  file.path(paths$out_dir, "maaslin3_pitt_genus"),
+  fixed_effects = c("Response", "Sequencing_Batch"),
+  reference     = "Response,Non_responder;Sequencing_Batch,August2024"
+)
+
+
+pitt_results <- read_tsv(file.path(paths$out_dir,
+                          "maaslin3_pitt_genus/all_results.tsv"))
+
+# Top Response hits
+pitt_response <- pitt_results %>%
+  filter(metadata == "Response") %>%
+  arrange(qval_individual) %>%
+  head(15) %>%
+  select(feature, value, model, coef, stderr,
+         pval_individual, qval_individual)
+
+options(width = 250)
+print(pitt_response, n = 15)
+
+# Anything significant at q < 0.10?
+cat("\nFeatures at q < 0.10 for Response:\n")
+pitt_results %>%
+  filter(metadata == "Response", qval_individual < 0.10) %>%
+  arrange(qval_individual) %>%
+  print(n = Inf)
+
+# How much does batch eat — top batch hits
+cat("\nTop Sequencing_Batch effects (just to gauge magnitude):\n")
+pitt_results %>%
+  filter(metadata == "Sequencing_Batch") %>%
+  arrange(qval_individual) %>%
+  head(10) %>%
+  select(feature, value, model, coef, qval_individual) %>%
+  print()
+
+
+m3_sheba <- run_maaslin3_v4(
+  sheba_qc,
+  file.path(paths$out_dir, "maaslin3_sheba_genus_v4"),
+  fixed_effects = c("Response"),
+  reference     = "Response,Non_responder"
+)
+
+
+sheba_results <- read_tsv(file.path(paths$out_dir,
+                          "maaslin3_sheba_genus_v4/all_results.tsv"))
+
+# Top Response hits
+sheba_response <- sheba_results %>%
+  filter(metadata == "Response") %>%
+  arrange(qval_individual) %>%
+  head(15) %>%
+  select(feature, value, model, coef, stderr,
+         pval_individual, qval_individual)
+
+options(width = 250)
+print(sheba_response, n = 15)
+
+# Anything significant at q < 0.10?
+cat("\nFeatures at q < 0.10 for Response:\n")
+sheba_results %>%
+  filter(metadata == "Response", qval_individual < 0.10) %>%
+  arrange(qval_individual) %>%
+  print(n = Inf)
+
+# How much does batch eat — top batch hits
+if (any(sheba_results$metadata == "Sequencing_Batch")) {
+cat("\nTop Sequencing_Batch effects (just to gauge magnitude):\n")
+sheba_results %>%
+  filter(metadata == "Sequencing_Batch") %>%
+  arrange(qval_individual) %>%
+  head(10) %>%
+  select(feature, value, model, coef, qval_individual) %>%
+  print()
+}
+
+# Pull all Sheba abundance hits at p < 0.05
+sheba_p05 <- sheba_results %>%
+  filter(metadata == "Response", model == "abundance",
+         pval_individual < 0.05) %>%
+  mutate(genus_short = sub(".*\\|g__", "g__", feature),
+         genus_short = sub("\\|s__.*$", "", genus_short)) %>%
+  select(genus_short, sheba_coef = coef,
+         sheba_p = pval_individual, sheba_q = qval_individual)
+
+# Same for Pitt
+pitt_p05 <- pitt_results %>%
+  filter(metadata == "Response", model == "abundance",
+         pval_individual < 0.05) %>%
+  mutate(genus_short = feature) %>%   # Pitt features already short
+  select(genus_short, pitt_coef = coef,
+         pitt_p = pval_individual, pitt_q = qval_individual)
+
+# Cross-check: does each Sheba hit have a matching Pitt result with same direction?
+sheba_in_pitt <- sheba_p05 %>%
+  left_join(
+    pitt_results %>%
+      filter(metadata == "Response", model == "abundance") %>%
+      mutate(genus_short = feature) %>%
+      select(genus_short, pitt_coef = coef, pitt_p = pval_individual),
+    by = "genus_short"
+  )
+print(sheba_in_pitt)
+
+# And vice versa
+pitt_in_sheba <- pitt_p05 %>%
+  left_join(
+    sheba_results %>%
+      filter(metadata == "Response", model == "abundance") %>%
+      mutate(genus_short = sub(".*\\|g__", "g__", feature),
+             genus_short = sub("\\|s__.*$", "", genus_short)) %>%
+      select(genus_short, sheba_coef = coef, sheba_p = pval_individual),
+    by = "genus_short"
+  )
+print(pitt_in_sheba)
+
+```
+
+# 8. DA sensitivity — ANCOM-BC2 + LinDA
+
+Reporting concordance across methods is more informative than picking a
+favorite. A taxon hit by 2/3 methods at q < 0.10 is more credible than a
+top hit from any single method.
+
+```{r ancombc-linda}
+# ---- ANCOM-BC2 ---------------------------------------------------------------
+
+run_ancombc <- function(m, fix_formula, group = "Response") {
+  ps <- file2meco::meco2phyloseq(m)
+  ps_genus <- phyloseq::tax_glom(ps, taxrank = "Genus", NArm = TRUE)
+
+  ANCOMBC::ancombc2(
+    data           = ps_genus,
+    tax_level      = "Genus",
+    fix_formula    = fix_formula,
+    p_adj_method   = "BH",
+    prv_cut        = PARAMS$prevalence_threshold,
+    lib_cut        = 0,             
+    group          = group,
+    struc_zero     = TRUE,              # <- enable structural-zero detection
+    neg_lb         = TRUE,              # <- pair with struc_zero
+    alpha          = PARAMS$q_value_threshold,
+    n_cl           = 1,
+    verbose        = FALSE,
+    global         = FALSE,
+    pairwise       = FALSE,
+    dunnet         = FALSE,
+    trend          = FALSE,
+    iter_control   = list(tol = 1e-2, max_iter = 20, verbose = FALSE),
+    em_control     = list(tol = 1e-5, max_iter = 100)
+  )
+}
+
+ab_sheba <- run_ancombc(sheba_qc, fix_formula = "Response")
+ab_pitt  <- run_ancombc(pitt_qc,  fix_formula = "Response + Sequencing_Batch")
+
+# Pull a tidy hit table from an ANCOM-BC2 result. Mirrors get_linda_hits below
+# so downstream filter(passes_q) calls work uniformly across DA methods.
+# ANCOM-BC2's $res table names columns as <metric>_<group_level>; for
+# Response = factor(c("Non_responder","Responder")) the contrast level is
+# "ResponseResponder", matching LinDA's term naming.
+get_ancombc_hits <- function(ab, term = "ResponseResponder",
+                              q_thresh = PARAMS$q_value_threshold) {
+  res <- ab$res
+  if (is.null(res)) {
+    stop("ANCOM-BC2 result has no $res table.")
+  }
+  # Resolve column names defensively — different ANCOMBC2 versions use slightly
+  # different conventions (e.g. with/without "Response" prefix).
+  lfc_col <- intersect(c(paste0("lfc_", term),
+                          sub("^Response", "lfc_Response", term)),
+                        colnames(res))[1]
+  p_col   <- intersect(c(paste0("p_",   term),
+                          sub("^Response", "p_Response",   term)),
+                        colnames(res))[1]
+  q_col   <- intersect(c(paste0("q_",   term),
+                          sub("^Response", "q_Response",   term)),
+                        colnames(res))[1]
+  if (any(is.na(c(lfc_col, p_col, q_col)))) {
+    stop("ANCOM-BC2 result missing expected columns for term '", term,
+         "'.\n  Available: ", paste(colnames(res), collapse = ", "))
+  }
+  data.frame(
+    taxon    = res$taxon,
+    lfc      = res[[lfc_col]],
+    p        = res[[p_col]],
+    q        = res[[q_col]],
+    passes_q = res[[q_col]] < q_thresh,
+    stringsAsFactors = FALSE
+  ) %>% arrange(q)
+}
+
+ab_sheba_hits <- get_ancombc_hits(ab_sheba)
+ab_pitt_hits  <- get_ancombc_hits(ab_pitt)
+
+cat("\nANCOM-BC2 — Sheba top 15:\n"); print(head(ab_sheba_hits, 15))
+cat("\nANCOM-BC2 — Sheba q<0.10:\n"); print(filter(ab_sheba_hits, passes_q))
+cat("\nANCOM-BC2 — Pitt  top 15:\n"); print(head(ab_pitt_hits, 15))
+cat("\nANCOM-BC2 — Pitt  q<0.10:\n"); print(filter(ab_pitt_hits, passes_q))
+# ---- LinDA -------------------------------------------------------------------
+
+run_linda <- function(m, formula) {
+  # Build the same genus-collapsed, placeholder-stripped abundance matrix
+  # that we used for MaAsLin3, for consistency.
+  ga <- as.data.frame(m$taxa_abund$Genus)
+  bare <- sub(".*\\|", "", rownames(ga))
+  ga$g <- bare
+  ga <- ga %>% group_by(g) %>%
+    summarise(across(everything(), sum), .groups = "drop") %>%
+    as.data.frame()
+  rownames(ga) <- ga$g; ga$g <- NULL
+  ga <- ga[!grepl("^g__GGB|^g__FGB|^g__OFGB|^g__CFGB", rownames(ga)), ]
+  ga <- ga[rowSums(ga) > 0, , drop = FALSE]   # drop all-zero rows
+
+  # Subset metadata to model variables only (same defensive trick as MaAsLin3)
+  meta <- as.data.frame(m$sample_table)
+  vars <- all.vars(as.formula(paste0("~", formula)))
+  meta <- meta[, vars, drop = FALSE]
+  for (col in vars) {
+    if (is.factor(meta[[col]])) meta[[col]] <- droplevels(meta[[col]])
+  }
+
+  MicrobiomeStat::linda(
+    feature.dat       = ga,
+    meta.dat          = meta,
+    formula           = paste0("~", formula),
+    feature.dat.type  = "proportion",
+    prev.filter       = PARAMS$prevalence_threshold,
+    mean.abund.filter = PARAMS$abundance_threshold,
+    adaptive          = TRUE,
+    p.adj.method      = "BH",
+    alpha             = PARAMS$q_value_threshold
+  )
+}
+
+linda_sheba <- run_linda(sheba_qc, "Response")
+linda_pitt  <- run_linda(pitt_qc,  "Response + Sequencing_Batch")
+
+# Extract Response hits — LinDA's output is a list keyed by term name.
+# For Response with Non_responder as reference, the term name is
+# "ResponseResponder" (no spaces).
+get_linda_hits <- function(ld, term = "ResponseResponder",
+                            q_thresh = PARAMS$q_value_threshold) {
+  out <- ld$output[[term]]
+  if (is.null(out)) {
+    stop("LinDA output has no term '", term, "'. Available: ",
+         paste(names(ld$output), collapse = ", "))
+  }
+  data.frame(
+    taxon    = rownames(out),
+    lfc      = out$log2FoldChange,
+    p        = out$pvalue,
+    q        = out$padj,
+    passes_q = out$padj < q_thresh,
+    stringsAsFactors = FALSE
+  ) %>% arrange(q)
+}
+
+linda_sheba_hits <- get_linda_hits(linda_sheba)
+linda_pitt_hits  <- get_linda_hits(linda_pitt)
+
+cat("\nLinDA — Sheba top 15:\n"); print(head(linda_sheba_hits, 15))
+cat("\nLinDA — Sheba q<0.10:\n"); print(filter(linda_sheba_hits, passes_q))
+
+cat("\nLinDA — Pitt  top 15:\n"); print(head(linda_pitt_hits, 15))
+cat("\nLinDA — Pitt  q<0.10:\n"); print(filter(linda_pitt_hits, passes_q))
+
+
+
+# Build a common comparison frame
+common_table <- inner_join(
+  linda_sheba_hits %>% select(taxon, sheba_lfc = lfc, sheba_p = p, sheba_q = q),
+  linda_pitt_hits  %>% select(taxon, pitt_lfc  = lfc, pitt_p  = p, pitt_q  = q),
+  by = "taxon"
+) %>%
+  arrange(pmin(sheba_q, pitt_q))
+
+cat("Top genera tested in both cohorts (sorted by min q):\n")
+print(head(common_table, 30))
+
+# Directional agreement on hits with p < 0.05 in either cohort
+direction_check <- common_table %>%
+  filter(sheba_p < 0.05 | pitt_p < 0.05) %>%
+  mutate(direction_agrees = sign(sheba_lfc) == sign(pitt_lfc)) %>%
+  arrange(desc(direction_agrees), pmin(sheba_q, pitt_q))
+
+print(as.data.frame(direction_check))
+
+
+#---------------------------------ALDEX2---------------------------------------
+library(ALDEx2)
+
+run_aldex2 <- function(m, covariate = "Response",
+                       drop_placeholder_genera = TRUE) {
+  ga <- as.data.frame(m$taxa_abund$Genus)
+  bare <- sub(".*\\|", "", rownames(ga))
+  ga$g <- bare
+  ga <- ga %>% group_by(g) %>%
+    summarise(across(everything(), sum), .groups = "drop") %>%
+    as.data.frame()
+  rownames(ga) <- ga$g; ga$g <- NULL
+  if (drop_placeholder_genera) {
+    ga <- ga[!grepl("^g__GGB|^g__FGB|^g__OFGB|^g__CFGB", rownames(ga)), ]
+  }
+
+  # ALDEx2 needs counts. MetaPhlAn output is relative abundance summing to 100;
+  # multiply by a constant to convert to pseudo-counts. The Dirichlet sampling
+  # is invariant to total scaling, so the scale doesn't affect results.
+  cnt <- round(as.matrix(ga) * 1000)
+  storage.mode(cnt) <- "integer"
+
+  meta <- as.data.frame(m$sample_table)
+  conds <- as.character(meta[[covariate]])
+
+  # ALDEx2 standard pipeline
+  x  <- ALDEx2::aldex.clr(cnt, conds, mc.samples = 128, denom = "all")
+  tt <- ALDEx2::aldex.ttest(x, paired.test = FALSE, verbose = FALSE)
+  ef <- ALDEx2::aldex.effect(x, useMC = FALSE, verbose = FALSE)
+
+  data.frame(
+    taxon         = rownames(tt),
+    diff_btw      = ef$diff.btw,        # CLR-scale mean difference
+    diff_win      = ef$diff.win,        # within-group dispersion
+    effect        = ef$effect,          # standardized effect size (median)
+    overlap       = ef$overlap,
+    we.ep         = tt$we.ep,           # Welch's t-test p
+    we.eBH        = tt$we.eBH,          # BH-corrected
+    wi.ep         = tt$wi.ep,           # Wilcoxon p
+    wi.eBH        = tt$wi.eBH,
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(we.eBH) %>%
+    mutate(passes_q = we.eBH < PARAMS$q_value_threshold)
+}
+
+aldex_sheba <- run_aldex2(sheba_qc, "Response")
+aldex_pitt  <- run_aldex2(pitt_qc,  "Response")    # unadjusted; see note below
+
+cat("\nALDEx2 — Sheba top 15:\n"); print(head(aldex_sheba, 15))
+cat("\nALDEx2 — Sheba q<0.10:\n"); print(filter(aldex_sheba, passes_q))
+
+cat("\nALDEx2 — Pitt top 15:\n"); print(head(aldex_pitt, 15))
+cat("\nALDEx2 — Pitt q<0.10:\n"); print(filter(aldex_pitt, passes_q))
+```
+
+
+
+
+
+
+
+```{r}
+# ---- §7d: Three-method consensus extraction --------------------------------
+
+library(tidyverse)
+
+# Bare-genus extractor; handles full lineages and already-bare names
+bare_genus <- function(x) {
+  out <- sub(".*\\|", "", x)
+  sub("^g__", "g__", out)  # leave g__ prefix; we'll match on it
+}
+
+# Placeholder genera to exclude from the consensus (locked decision #9)
+placeholder_pat <- "^g__(GGB|FGB|OFGB|CFGB)"
+
+# ---- per-cohort tidiers ----------------------------------------------------
+
+tidy_maaslin3 <- function(path) {
+  read_tsv(path, show_col_types = FALSE) %>%
+    filter(model == "abundance",
+           metadata == "Response") %>%
+    mutate(genus = bare_genus(feature)) %>%
+    transmute(genus,
+              ml_coef = coef,
+              ml_sign = sign(coef),
+              ml_p    = pval_individual,
+              ml_q    = qval_individual)
+}
+
+tidy_linda <- function(linda_obj) {
+  # Wrapper returns the raw MicrobiomeStat::linda object. Find the Response slot.
+  slot <- grep("Response", names(linda_obj$output), value = TRUE)[1]
+  stopifnot(!is.na(slot))
+  as.data.frame(linda_obj$output[[slot]]) %>%
+    rownames_to_column("feature") %>%
+    mutate(genus = bare_genus(feature)) %>%
+    transmute(genus,
+              ld_lfc  = log2FoldChange,
+              ld_sign = sign(log2FoldChange),
+              ld_p    = pvalue,
+              ld_q    = padj)
+}
+
+tidy_aldex <- function(ad_df) {
+  ad_df %>%
+    transmute(genus   = taxon,             # already bare in your output
+              ad_diff = diff_btw,
+              ad_eff  = effect,
+              ad_sign = sign(effect),
+              ad_p    = we.ep,
+              ad_q    = we.eBH)
+}
+
+# ---- combine + tier --------------------------------------------------------
+
+build_consensus <- function(maaslin_path, linda_obj, aldex_df, cohort_label) {
+  ml <- tidy_maaslin3(maaslin_path)
+  ld <- tidy_linda(linda_obj)
+  ad <- tidy_aldex(aldex_df)
+  
+  ml %>%
+    full_join(ld, by = "genus") %>%
+    full_join(ad, by = "genus") %>%
+    filter(!grepl(placeholder_pat, genus)) %>%
+    mutate(
+      n_q10 = (!is.na(ml_q) & ml_q < 0.10) +
+              (!is.na(ld_q) & ld_q < 0.10) +
+              (!is.na(ad_q) & ad_q < 0.10),
+      n_p05 = (!is.na(ml_p) & ml_p < 0.05) +
+              (!is.na(ld_p) & ld_p < 0.05) +
+              (!is.na(ad_p) & ad_p < 0.05),
+      n_pos = replace_na(ml_sign > 0, FALSE) +
+              replace_na(ld_sign > 0, FALSE) +
+              replace_na(ad_sign > 0, FALSE),
+      n_neg = replace_na(ml_sign < 0, FALSE) +
+              replace_na(ld_sign < 0, FALSE) +
+              replace_na(ad_sign < 0, FALSE),
+      sign_concord = (n_pos > 0 & n_neg == 0) | (n_neg > 0 & n_pos == 0),
+      direction = case_when(
+        n_pos > 0 & n_neg == 0 ~ "R-enriched",
+        n_neg > 0 & n_pos == 0 ~ "NR-enriched",
+        n_pos > 0 & n_neg  > 0 ~ "mixed",
+        TRUE ~ "untested"
+      ),
+      tier = case_when(
+        n_q10 >= 2 & sign_concord ~ "Strong",
+        n_q10 >= 1 & n_p05 >= 2 & sign_concord ~ "Moderate",
+        n_p05 >= 2 & sign_concord ~ "Suggestive",
+        n_p05 >= 1 ~ "Nominal",
+        TRUE ~ "None"
+      ),
+      cohort = cohort_label
+    ) %>%
+    arrange(factor(tier, levels = c("Strong","Moderate","Suggestive","Nominal","None")),
+            pmin(replace_na(ml_q,1), replace_na(ld_q,1), replace_na(ad_q,1)))
+}
+
+con_sheba <- build_consensus(
+  file.path(paths$out_dir, "maaslin3_sheba_genus_v4/all_results.tsv"),
+  linda_sheba, aldex_sheba, "Sheba")
+
+con_pitt <- build_consensus(
+  file.path(paths$out_dir, "maaslin3_pitt_genus/all_results.tsv"),
+  linda_pitt,  aldex_pitt,  "Pitt")
+
+# ---- cross-cohort concordance ---------------------------------------------
+
+both <- full_join(
+  con_sheba %>% select(genus, dir_S = direction, tier_S = tier,
+                       n_p05_S = n_p05, n_q10_S = n_q10),
+  con_pitt  %>% select(genus, dir_P = direction, tier_P = tier,
+                       n_p05_P = n_p05, n_q10_P = n_q10),
+  by = "genus"
+) %>%
+  mutate(
+    cross = case_when(
+      dir_S == "R-enriched"  & dir_P == "R-enriched"  & (n_p05_S >= 1 | n_p05_P >= 1) ~ "concordant_R",
+      dir_S == "NR-enriched" & dir_P == "NR-enriched" & (n_p05_S >= 1 | n_p05_P >= 1) ~ "concordant_NR",
+      (dir_S == "R-enriched"  & dir_P == "NR-enriched") |
+      (dir_S == "NR-enriched" & dir_P == "R-enriched") ~ "discordant",
+      TRUE ~ "weak/single-cohort"
+    )
+  )
+
+# ---- summary tables --------------------------------------------------------
+
+cat("\n=== Sheba consensus by tier ===\n")
+print(con_sheba %>% count(tier, direction))
+cat("\n=== Pitt consensus by tier ===\n")
+print(con_pitt  %>% count(tier, direction))
+cat("\n=== Cross-cohort concordance (p<0.05 in at least one cohort) ===\n")
+print(both %>% filter(cross %in% c("concordant_R","concordant_NR","discordant")) %>%
+      count(cross))
+
+cat("\n--- Sheba: Moderate or better ---\n")
+print(con_sheba %>% filter(tier %in% c("Strong","Moderate")) %>%
+      select(genus, direction, ml_p, ml_q, ld_p, ld_q, ad_p, ad_q))
+cat("\n--- Pitt: Moderate or better ---\n")
+print(con_pitt %>% filter(tier %in% c("Strong","Moderate")) %>%
+      select(genus, direction, ml_p, ml_q, ld_p, ld_q, ad_p, ad_q))
+
+# Save for downstream heatmap
+write_tsv(con_sheba, file.path(paths$out_dir, "consensus_sheba.tsv"))
+write_tsv(con_pitt,  file.path(paths$out_dir, "consensus_pitt.tsv"))
+write_tsv(both,      file.path(paths$out_dir, "consensus_cross_cohort.tsv"))
+
+# 1. The 8 cross-cohort concordant — the replicating signals
+cat("\n=== 8 cross-cohort concordant genera ===\n")
+both %>%
+  filter(cross %in% c("concordant_R","concordant_NR")) %>%
+  left_join(con_sheba %>% select(genus, ml_p_S=ml_p, ld_p_S=ld_p, ad_p_S=ad_p,
+                                 ml_q_S=ml_q, ld_q_S=ld_q, ad_q_S=ad_q),
+            by="genus") %>%
+  left_join(con_pitt  %>% select(genus, ml_p_P=ml_p, ld_p_P=ld_p, ad_p_P=ad_p,
+                                 ml_q_P=ml_q, ld_q_P=ld_q, ad_q_P=ad_q),
+            by="genus") %>%
+  arrange(cross, pmin(replace_na(ml_p_S,1), replace_na(ld_p_S,1), replace_na(ad_p_S,1),
+                      replace_na(ml_p_P,1), replace_na(ld_p_P,1), replace_na(ad_p_P,1))) %>%
+  print(n = Inf, width = Inf)
+
+# 2. Suggestive+ in either cohort — the heatmap candidate set
+cat("\n=== Suggestive+ in Sheba (Moderate + Suggestive) ===\n")
+print(con_sheba %>% filter(tier %in% c("Strong","Moderate","Suggestive")) %>%
+      select(genus, tier, direction, ml_p, ld_p, ad_p), n = Inf)
+cat("\n=== Suggestive+ in Pitt ===\n")
+print(con_pitt  %>% filter(tier %in% c("Strong","Moderate","Suggestive")) %>%
+      select(genus, tier, direction, ml_p, ld_p, ad_p), n = Inf)
+
+# 3. Sanity-check the 59 discordant — are they driven by within-cohort method 
+#    sign concordance, or are some "discordant" only because one method in one
+#    cohort happens to flip? Useful to know before discussing them in methods.
+cat("\n=== Discordant breakdown ===\n")
+both %>%
+  filter(cross == "discordant") %>%
+  count(n_p05_S, n_p05_P) %>%
+  print(n = Inf)
+```
+
+```{r}
+# ---- §8: Heatmap of consensus-supported genera -----------------------------
+# ============================================================================
+# §8: Consensus heatmaps
+# ============================================================================
+# Two heatmaps from the 3-method consensus (MaAsLin3 + LinDA + ALDEx2):
+#   §8a — 10-feature heatmap of Suggestive+ consensus genera (headline)
+#   §8b — wider Nominal+ heatmap organized by evidence block (predicate
+#         for the "cohorts are distinct" framing)
+#
+# Inputs (from §7c-d):
+#   sheba_qc, pitt_qc      microeco objects (post-QC)
+#   con_sheba, con_pitt    per-cohort consensus tables
+#   both                   cross-cohort concordance table
+# ============================================================================
+
+library(ComplexHeatmap)
+library(circlize)
+library(tidyverse)
+
+# ---- Shared helpers --------------------------------------------------------
+
+placeholder_pat <- "^g__(GGB|FGB|OFGB|CFGB)"
+
+# Per-sample CLR using full QC-filtered genus set as the reference
+get_genus_abund <- function(m) {
+  ga <- as.data.frame(m$taxa_abund$Genus)
+  ga$genus_bare <- sub(".*\\|", "", rownames(ga))
+  ga %>%
+    group_by(genus_bare) %>%
+    summarise(across(everything(), sum), .groups = "drop") %>%
+    column_to_rownames("genus_bare")
+}
+
+clr_full <- function(ab) {
+  pc <- min(ab[ab > 0]) / 2
+  log_ab <- log(ab + pc)
+  apply(log_ab, 2, function(z) z - mean(z))
+}
+
+align_features <- function(clr_mat, feats) {
+  out <- matrix(NA_real_, nrow = length(feats), ncol = ncol(clr_mat),
+                dimnames = list(feats, colnames(clr_mat)))
+  ix <- intersect(feats, rownames(clr_mat))
+  out[ix, ] <- clr_mat[ix, ]
+  out
+}
+
+# Sample annotation (Cohort × Response grouping)
+build_col_anno <- function(m, cohort_label) {
+  st <- as.data.frame(m$sample_table)
+  st$SampleID <- rownames(st)
+  data.frame(
+    SampleID = st$SampleID,
+    Cohort   = cohort_label,
+    Response = st$Response,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---- Build the per-cohort CLR matrices once --------------------------------
+
+ab_S  <- get_genus_abund(sheba_qc)
+ab_P  <- get_genus_abund(pitt_qc)
+clr_S <- clr_full(ab_S)
+clr_P <- clr_full(ab_P)
+
+col_anno <- bind_rows(
+  build_col_anno(sheba_qc, "Sheba"),
+  build_col_anno(pitt_qc,  "Pitt")
+) %>%
+  mutate(grp = factor(paste(Cohort, Response, sep = "_"),
+                      levels = c("Sheba_Non_responder", "Sheba_Responder",
+                                 "Pitt_Non_responder",  "Pitt_Responder"))) %>%
+  arrange(grp)
+
+# Shared color palette
+response_col <- c(Non_responder = "#e31a1c", Responder = "#1f78b4")
+clr_palette  <- colorRamp2(c(-2, 0, 2), c("#2166ac", "#f7f7f7", "#b2182b"))
+
+ha_top_min <- HeatmapAnnotation(
+  Response = col_anno$Response,
+  col = list(Response = response_col),
+  annotation_name_side = "left"
+)
+
+# ============================================================================
+# §8a: 10-feature consensus heatmap (headline)
+# ============================================================================
+
+features_10 <- c(
+  "g__Slackia", "g__Flavonifractor", "g__Eggerthella", "g__Hungatella",
+  "g__Clostridiaceae_unclassified", "g__Lachnospira",
+  "g__Flintibacter", "g__Oscillibacter",
+  "g__Actinomyces", "g__Candidatus_Borkfalkia"
+)
+
+direction_lookup <- c(
+  "g__Slackia"                     = "NR-enriched",
+  "g__Flavonifractor"              = "R-enriched",
+  "g__Eggerthella"                 = "R-enriched",
+  "g__Hungatella"                  = "R-enriched",
+  "g__Clostridiaceae_unclassified" = "R-enriched",
+  "g__Lachnospira"                 = "R-enriched",
+  "g__Flintibacter"                = "R-enriched",
+  "g__Oscillibacter"               = "R-enriched",
+  "g__Actinomyces"                 = "NR-enriched",
+  "g__Candidatus_Borkfalkia"       = "R-enriched"
+)
+
+mat_10 <- cbind(align_features(clr_S, features_10),
+                align_features(clr_P, features_10))[, col_anno$SampleID]
+mat_10z <- t(scale(t(mat_10)))
+
+display_10 <- sub("^g__", "", rownames(mat_10z))
+display_10 <- sub("Candidatus_Borkfalkia", "Ca. Borkfalkia", display_10)
+rownames(mat_10z) <- display_10
+
+ht_10 <- Heatmap(
+  mat_10z,
+  name = "CLR z-score",
+  col  = clr_palette,
+  na_col = "#dddddd",
+  top_annotation = ha_top_min,
+  column_split   = col_anno$grp,
+  row_split      = factor(direction_lookup[features_10],
+                          levels = c("NR-enriched", "R-enriched")),
+  cluster_columns       = FALSE,
+  cluster_column_slices = FALSE,
+  cluster_rows          = TRUE,
+  cluster_row_slices    = FALSE,
+  show_column_names = FALSE,
+  row_names_side    = "right",
+  row_title         = NULL,
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  heatmap_legend_param = list(direction = "horizontal")
+)
+
+svg(file.path(paths$out_dir, "heatmap_consensus_genera.svg"),
+    width = 12, height = 4.5)
+draw(ht_10, merge_legend = TRUE, heatmap_legend_side = "bottom")
+dev.off()
+png(file.path(paths$out_dir, "heatmap_consensus_genera.png"),
+    width = 12, height = 4.5, units = "in", res = 300)
+draw(ht_10, merge_legend = TRUE, heatmap_legend_side = "bottom")
+dev.off()
+
+# ============================================================================
+# §8b: Wider Nominal+ heatmap, organized by evidence block
+# ============================================================================
+
+nom_levels <- c("Strong", "Moderate", "Suggestive", "Nominal")
+
+s_nom <- con_sheba %>%
+  filter(tier %in% nom_levels) %>%
+  select(genus, tier_S = tier, dir_S = direction)
+
+p_nom <- con_pitt %>%
+  filter(tier %in% nom_levels) %>%
+  select(genus, tier_P = tier, dir_P = direction)
+
+# ---- Build feat_tbl: combine bilateral + per-cohort genus hits ----
+# Modeled on the pathway-level construction at §9A (L2265): bilateral set is
+# the inner join with concordant direction; "Sheba-only" / "Pitt-only" are
+# the anti-joins. Single `block` column drives row splits and strength scoring.
+bilateral_nom_genus <- inner_join(s_nom, p_nom, by = "genus") %>%
+  filter(dir_S == dir_P, dir_S != "mixed") %>%
+  transmute(genus, source = "Bilateral_nom")
+
+s_only_genus <- s_nom %>%
+  filter(!genus %in% p_nom$genus) %>%
+  transmute(genus, source = "Sheba_only")
+
+p_only_genus <- p_nom %>%
+  filter(!genus %in% s_nom$genus) %>%
+  transmute(genus, source = "Pitt_only")
+
+feat_tbl <- bind_rows(
+  bilateral_nom_genus,
+  s_only_genus,
+  p_only_genus
+) %>%
+  distinct(genus, .keep_all = TRUE) %>%
+  mutate(block = case_when(
+    source == "Bilateral_nom" ~ "Bilateral",
+    source == "Sheba_only"    ~ "Sheba-only",
+    source == "Pitt_only"     ~ "Pitt-only"
+  ))
+
+cat("\nGenus evidence blocks:\n")
+print(table(feat_tbl$block, useNA = "ifany"))
+
+# ---- Order rows within each block by R-vs-NR strength ----
+   row_strength <- function(genus, cohort_clr, sample_table) {
+     if (!genus %in% rownames(cohort_clr)) return(NA_real_)
+     v <- cohort_clr[genus, ]
+     resp <- sample_table$Response[match(names(v), rownames(sample_table))]
+     mean(v[resp == "Responder"], na.rm = TRUE) -
+       mean(v[resp == "Non_responder"], na.rm = TRUE)
+   }
+   feat_tbl <- feat_tbl %>%
+     rowwise() %>%
+     mutate(strength = case_when(
+       block == "Sheba-only" ~ row_strength(genus, clr_S, as.data.frame(sheba_qc$sample_table)),
+       block == "Pitt-only"  ~ row_strength(genus, clr_P, as.data.frame(pitt_qc$sample_table)),
+       block == "Bilateral"  ~ (row_strength(genus, clr_S, as.data.frame(sheba_qc$sample_table)) +
+                                row_strength(genus, clr_P, as.data.frame(pitt_qc$sample_table))) / 2
+     )) %>%
+     ungroup() %>%
+     arrange(factor(block, levels = c("Sheba-only", "Bilateral", "Pitt-only")),
+             desc(strength))   # R-enriched on top, NR-enriched on bottom
+
+cat("\nFeatures by block:\n")
+print(table(feat_tbl$block))
+cat("Total features:", nrow(feat_tbl), "\n")
+
+features_wide <- feat_tbl$genus
+
+feat_tbl <- feat_tbl %>% filter(genus != "g__Klebsiella")
+features_wide <- feat_tbl$genus
+
+mat_w <- cbind(align_features(clr_S, features_wide),
+               align_features(clr_P, features_wide))[, col_anno$SampleID]
+mat_wz <- t(scale(t(mat_w)))
+
+display_w <- sub("^g__", "", features_wide)
+display_w <- sub("Candidatus_Borkfalkia", "Ca. Borkfalkia", display_w)
+display_w <- sub("_unclassified", " (unclassified)", display_w)
+rownames(mat_wz) <- display_w
+
+ht_wide <- Heatmap(
+  mat_wz,
+  name = "CLR z-score",
+  col  = clr_palette,
+  na_col = "#dddddd",
+  top_annotation = ha_top_min,
+  column_split   = col_anno$grp,
+  row_split      = factor(feat_tbl$block,
+                          levels = c("Sheba-only", "Bilateral", "Pitt-only")),
+  cluster_columns       = FALSE,
+  cluster_column_slices = FALSE,
+  cluster_rows          = FALSE,
+  cluster_row_slices    = FALSE,
+  show_column_names = FALSE,
+  row_names_side    = "right",
+  row_title_gp      = gpar(fontsize = 11, fontface = "bold"),
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  heatmap_legend_param = list(direction = "horizontal")
+)
+
+svg(file.path(paths$out_dir, "heatmap_cohort_distinct.svg"),
+    width = 13, height = 8)
+draw(ht_wide, merge_legend = TRUE, heatmap_legend_side = "bottom")
+dev.off()
+png(file.path(paths$out_dir, "heatmap_cohort_distinct.png"),
+    width = 13, height = 8, units = "in", res = 300)
+draw(ht_wide, merge_legend = TRUE, heatmap_legend_side = "bottom")
+dev.off()
+
+cat("\nSaved:\n  heatmap_consensus_genera.[svg|png]\n",
+    "  heatmap_cohort_distinct.[svg|png]\n", sep = "")
+```
+
+
+
+# 9. HUMAnN pathway analysis per cohort
+
+We use the unstratified `pathabundance_relab` file directly. **Don't**
+re-derive pathway abundances by summing EC numbers — HUMAnN's pathway
+calculation accounts for pathway hierarchy and gap-filling.
+
+# ============================================================================
+# §9.0  Load + clean + harmonize HUMAnN pathabundance (both cohorts)
+# ============================================================================
+```{r}
+library(tidyverse)
+
+paths$humann_dir <- file.path(dirname(paths$out_dir),
+                              "metagenomics_pipeline_input")
+
+# ---- Sheba sample-ID mapper ---------------------------------------------
+
+clean_sheba_humann_id <- function(x) {
+  x <- sub("\r$", "", x)
+  x <- sub("_R1_kneaddata_merged_Abundance$", "", x)
+  x <- sub("_filtered$", "", x)
+  if (grepl("^96_ME$",  x)) return("p96A")
+  if (grepl("^96_S2$",  x)) return("p96B")
+  if (grepl("^177_ME$", x)) return("p177B")
+  patient <- sub("^([0-9]+[a-zA-Z]?).*", "\\1", x)
+  paste0("p", toupper(patient))
+}
+
+clean_pitt_humann_id <- function(x) {
+  x <- sub("^trimmed_", "", x)
+  x <- sub("_merged_Abundance$", "", x)
+  x
+}
+
+# ---- Loader ---------------------------------------------------------------
+# Reads the merged HUMAnN file, applies the per-cohort sample-ID cleaner,
+# averages p96A+p96B for Sheba, returns a numeric data frame keyed by
+# 'pathway' column.
+
+load_humann <- function(path, cohort) {
+  df <- read_tsv(path, comment = "", col_types = cols(.default = "c")) %>%
+    rename(pathway = 1) %>%
+    filter(pathway != "# Pathway HUMAnN v4.0.0.alpha.1") %>%
+    mutate(across(-pathway, as.numeric))
+  
+  cleaner <- switch(cohort,
+                    "Pitt"  = clean_pitt_humann_id,
+                    "Sheba" = clean_sheba_humann_id,
+                    stop("unknown cohort"))
+  
+  new_names <- vapply(colnames(df)[-1], cleaner, character(1))
+  colnames(df)[-1] <- new_names
+  
+  if (cohort == "Sheba" && all(c("p96A", "p96B") %in% colnames(df))) {
+    df$p96_avg <- (df$p96A + df$p96B) / 2
+    df <- df %>% select(-p96A, -p96B)
+    cat("[Sheba] averaged p96A + p96B -> p96_avg\n")
+  }
+  
+  cat("[", cohort, "] loaded:", ncol(df) - 1, "samples,",
+      nrow(df), "rows total\n")
+  df
+}
+
+humann_pitt  <- load_humann(file.path(paths$humann_dir,
+                                      "merged_pittsburgh_pathabunance.tsv"),
+                            "Pitt")
+humann_sheba <- load_humann(file.path(paths$humann_dir,
+                                      "pathabundance_merged_relab.tsv"),
+                            "Sheba")
+
+# ---- Splitter + prep -----------------------------------------------------
+# Splits a HUMAnN frame into (unstratified, stratified) matrices, subsets to
+# the QC sample set, drops UNMAPPED/UNINTEGRATED from unstratified,
+# renormalizes unstratified per-sample to relab among classified pathways.
+# Stratified is kept on its raw scale (we'll renormalize at follow-up time).
+
+prep_humann <- function(df, expected_samples, cohort_label) {
+  
+  # Subset columns to QC samples
+  keep    <- intersect(colnames(df)[-1], expected_samples)
+  dropped <- setdiff(colnames(df)[-1], expected_samples)
+  cat("\n[", cohort_label, "] keeping", length(keep), "samples; dropping",
+      length(dropped),
+      if (length(dropped)) paste0("(", paste(dropped, collapse = ", "), ")") else "",
+      "\n")
+  df <- df %>% select(pathway, all_of(keep))
+  
+  # Split unstratified vs stratified
+  is_strat <- grepl("\\|", df$pathway)
+  unstrat_df <- df %>% filter(!is_strat,
+                              !pathway %in% c("UNMAPPED", "UNINTEGRATED"))
+  strat_df   <- df %>% filter(is_strat)
+  
+  # Build unstratified matrix
+  m_u <- as.matrix(unstrat_df[, -1, drop = FALSE])
+  rownames(m_u) <- unstrat_df$pathway
+  
+  # Drop all-zero rows post-subset
+  zr <- rowSums(m_u) == 0
+  if (any(zr)) {
+    cat("  Dropped", sum(zr), "all-zero unstratified pathways post-subset\n")
+    m_u <- m_u[!zr, , drop = FALSE]
+  }
+  
+  # Per-sample renormalize (relab among classified pathways)
+  cs <- colSums(m_u)
+  if (any(cs == 0)) cat("  WARNING: zero-yield samples:",
+                        paste(colnames(m_u)[cs == 0], collapse = ", "), "\n")
+  m_u <- sweep(m_u, 2, ifelse(cs == 0, 1, cs), "/")
+  
+  # Stratified matrix (keep separately, no renorm — stratified contributions
+  # are fractions of their pathway, never DA features in their own right)
+  m_s <- as.matrix(strat_df[, -1, drop = FALSE])
+  rownames(m_s) <- strat_df$pathway
+  
+  cat("  Unstratified:", nrow(m_u), "pathways x", ncol(m_u), "samples\n")
+  cat("  Stratified:  ", nrow(m_s), "rows x",      ncol(m_s), "samples\n")
+  
+  list(unstrat = m_u, strat = m_s)
+}
+
+path_pitt  <- prep_humann(humann_pitt,  rownames(pitt_qc$sample_table),  "Pitt")
+path_sheba <- prep_humann(humann_sheba, rownames(sheba_qc$sample_table), "Sheba")
+
+# ---- Sanity checks --------------------------------------------------------
+cat("\n--- Column sum range (unstratified, should be ~1) ---\n")
+cat("Pitt:  ", paste(round(range(colSums(path_pitt$unstrat)),  4)), "\n")
+cat("Sheba: ", paste(round(range(colSums(path_sheba$unstrat)), 4)), "\n")
+
+cat("\n--- Pathway count comparison ---\n")
+cat("Pitt unstrat:  ", nrow(path_pitt$unstrat), "\n")
+cat("Sheba unstrat: ", nrow(path_sheba$unstrat), "\n")
+cat("Shared:        ",
+    length(intersect(rownames(path_pitt$unstrat),
+                     rownames(path_sheba$unstrat))), "\n")
+cat("Pitt-only:     ",
+    length(setdiff(rownames(path_pitt$unstrat),
+                   rownames(path_sheba$unstrat))), "\n")
+cat("Sheba-only:    ",
+    length(setdiff(rownames(path_sheba$unstrat),
+                   rownames(path_pitt$unstrat))), "\n")
+
+# ---- Save -----------------------------------------------------------------
+saveRDS(list(pitt = path_pitt, sheba = path_sheba),
+        file.path(paths$out_dir, "humann_pathway_data.rds"))
+
+
+```
+
+# ============================================================================
+# §9.1  Filter unstratified pathways (prev ≥10%, abundance ≥1e-4)
+# ============================================================================
+```{r}
+filter_pathway_mat <- function(mat, prev_thresh = 0.10, abund_thresh = 1e-4,
+                               label = "") {
+  prev <- rowMeans(mat > 0)
+  ma   <- rowMeans(mat)
+  keep <- prev >= prev_thresh & ma >= abund_thresh
+  
+  cat(label, ": pre-filter ", nrow(mat),
+      "; below prev ", prev_thresh, ": ", sum(prev < prev_thresh),
+      "; below mean ", abund_thresh, ": ", sum(ma < abund_thresh),
+      "; post-filter ", sum(keep), "\n", sep = "")
+  
+  mat[keep, , drop = FALSE]
+}
+
+path_pitt_f  <- filter_pathway_mat(path_pitt$unstrat,  label = "Pitt ")
+path_sheba_f <- filter_pathway_mat(path_sheba$unstrat, label = "Sheba")
+
+# ============================================================================
+# §9.2  Pathway β-diversity (Aitchison primary; same framework as §6)
+# ============================================================================
+
+library(vegan); library(ape); library(ggplot2); library(patchwork)
+
+run_pathway_beta <- function(mat_f, sample_table, formula_rhs, label,
+                             permdisp_groups = "Response") {
+  ab <- t(mat_f)                                  # samples × features
+  pc <- min(ab[ab > 0]) / 2                       # half-min-nonzero pseudocount
+  cl <- log(ab + pc)
+  cl <- t(apply(cl, 1, function(x) x - mean(x))) # CLR
+  d  <- dist(cl, method = "euclidean")            # Aitchison
+  
+  md <- as.data.frame(sample_table[rownames(ab), , drop = FALSE])
+  
+  # PERMANOVA marginal
+  set.seed(42)
+  ad <- adonis2(as.formula(paste("d ~", formula_rhs)),
+                data = md, permutations = PARAMS$permanova_perms, by = "margin")
+  
+  # PERMDISP for each requested group
+  pd <- lapply(permdisp_groups, function(g) {
+    if (!g %in% colnames(md)) return(NULL)
+    permutest(betadisper(d, md[[g]]),
+              permutations = PARAMS$permanova_perms)
+  })
+  names(pd) <- permdisp_groups
+  
+  # PCoA
+  ord <- pcoa(d)
+  eig <- 100 * ord$values$Relative_eig
+  df  <- data.frame(Axis1 = ord$vectors[, 1],
+                    Axis2 = ord$vectors[, 2],
+                    Response = md$Response)
+  
+  resp_p  <- ad["Response", "Pr(>F)"]
+  resp_r2 <- ad["Response", "R2"]
+  pd_resp <- pd$Response$tab[1, "Pr(>F)"]
+  
+  p <- ggplot(df, aes(Axis1, Axis2, color = Response)) +
+    geom_point(size = 3, alpha = 0.85) +
+    stat_ellipse(type = "t", level = 0.8) +
+    scale_color_manual(values = c(Non_responder = "#e31a1c",
+                                  Responder     = "#1f78b4")) +
+    labs(title = paste0(label, ": Pathway Aitchison PCoA"),
+         subtitle = sprintf("Response R²=%.3f, p=%.3f | PERMDISP-Response p=%.3f",
+                            resp_r2, resp_p, pd_resp),
+         x = sprintf("PCoA1 (%.1f%%)", eig[1]),
+         y = sprintf("PCoA2 (%.1f%%)", eig[2])) +
+    theme_bw(base_size = 12)
+  
+  list(adonis = ad, permdisp = pd, plot = p, distance = d, eig = eig)
+}
+
+beta_path_pitt  <- run_pathway_beta(
+  path_pitt_f, pitt_qc$sample_table,
+  "Response + Sequencing_Batch + Treatment_regimen",
+  "Pitt", permdisp_groups = c("Response", "Sequencing_Batch"))
+
+beta_path_sheba <- run_pathway_beta(
+  path_sheba_f, sheba_qc$sample_table,
+  "Response + Treatment_regimen",
+  "Sheba", permdisp_groups = "Response")
+
+# ---- Print PERMANOVA tables --------------------------------------------
+cat("\n========== PITT PATHWAY PERMANOVA (marginal) ==========\n")
+print(beta_path_pitt$adonis)
+cat("\nPERMDISP Response : p =",
+    beta_path_pitt$permdisp$Response$tab[1, "Pr(>F)"], "\n")
+cat("PERMDISP Batch    : p =",
+    beta_path_pitt$permdisp$Sequencing_Batch$tab[1, "Pr(>F)"], "\n")
+
+cat("\n========== SHEBA PATHWAY PERMANOVA (marginal) ==========\n")
+print(beta_path_sheba$adonis)
+cat("\nPERMDISP Response : p =",
+    beta_path_sheba$permdisp$Response$tab[1, "Pr(>F)"], "\n")
+
+# ---- Side-by-side comparison with genus β-diversity --------------------
+cat("\n========== GENUS vs PATHWAY (Aitchison, Response marginal) ==========\n")
+cat(sprintf("Sheba  | genus   R²=3.6%%  p=0.088\n"))
+cat(sprintf("Sheba  | pathway R²=%.1f%%  p=%.3f\n",
+            100 * beta_path_sheba$adonis["Response", "R2"],
+            beta_path_sheba$adonis["Response", "Pr(>F)"]))
+cat(sprintf("Pitt   | genus   R²=1.5%%  p=0.33\n"))
+cat(sprintf("Pitt   | pathway R²=%.1f%%  p=%.3f\n",
+            100 * beta_path_pitt$adonis["Response", "R2"],
+            beta_path_pitt$adonis["Response", "Pr(>F)"]))
+
+# ---- Save plots --------------------------------------------------------
+ggsave(file.path(paths$out_dir, "pcoa_pathway_pitt.svg"),
+       beta_path_pitt$plot, width = 7, height = 5.5)
+ggsave(file.path(paths$out_dir, "pcoa_pathway_sheba.svg"),
+       beta_path_sheba$plot, width = 7, height = 5.5)
+
+beta_path_pitt$plot | beta_path_sheba$plot
+```
+
+```{r}
+
+# ============================================================================
+# §9.3  Pathway DA: MaAsLin3 + LinDA + ALDEx2
+# ============================================================================
+
+dir.create(file.path(paths$out_dir, "humann_da"), showWarnings = FALSE)
+
+# ---- MaAsLin3 ----------------------------------------------------------
+# Pathways arrive as relab; MaAsLin3's TSS normalization is a no-op on these,
+# but we keep it to match §7 conventions. transform = "LOG" for log-relab.
+
+run_maaslin3_path <- function(mat_f, sample_table, output_dir, formula,
+                              reference = "Non_responder") {
+  abund <- as.data.frame(t(mat_f))
+  metad <- as.data.frame(sample_table)
+  
+  # Subset metadata to fixed-effect columns (the bug fix from §7)
+  fe <- all.vars(as.formula(paste("~", formula)))
+  metad <- metad[, fe, drop = FALSE]
+  metad$Response <- relevel(factor(metad$Response), ref = reference)
+  
+  # Align rows
+  shared <- intersect(rownames(abund), rownames(metad))
+  abund  <- abund[shared, , drop = FALSE]
+  metad  <- metad[shared, , drop = FALSE]
+  
+  maaslin3::maaslin3(
+    input_data       = abund,
+    input_metadata   = metad,
+    output           = output_dir,
+    formula          = paste("~", formula),
+    normalization    = "TSS",
+    transform        = "LOG",
+    correction       = "BH",
+    min_abundance    = 0,        # already filtered upstream
+    min_prevalence   = 0,
+    max_significance = 0.10,
+    cores            = 2,
+    plot_summary_plot   = TRUE,
+    plot_associations   = TRUE
+  )
+}
+
+# THESE TWO ARE CALLED FOR THEIR SIDE EFFECT, not for what they return. The
+# return value is never used -- the results are read back from disk on the
+# lines below -- but the call is what WRITES
+# humann_da/maaslin3_{sheba,pitt}_pathway/all_results.tsv, and those two files
+# are the pathway scan that Extended Data Fig. 2 draws and whose feature counts
+# the Results quote. A linter will call the assignments unused. Do not remove
+# them, and do not reduce them to bare calls without keeping the paths.
+ml_path_sheba <- run_maaslin3_path(
+  path_sheba_f, sheba_qc$sample_table,
+  file.path(paths$out_dir, "humann_da/maaslin3_sheba_pathway"),
+  "Response + Treatment_regimen")
+
+ml_path_pitt <- run_maaslin3_path(
+  path_pitt_f, pitt_qc$sample_table,
+  file.path(paths$out_dir, "humann_da/maaslin3_pitt_pathway"),
+  "Response + Sequencing_Batch + Treatment_regimen")
+
+ml_sheba_res <- read_tsv(
+  file.path(paths$out_dir, "humann_da/maaslin3_sheba_pathway/all_results.tsv"),
+  show_col_types = FALSE)
+ml_pitt_res <- read_tsv(
+  file.path(paths$out_dir, "humann_da/maaslin3_pitt_pathway/all_results.tsv"),
+  show_col_types = FALSE)
+
+cat("\n========== Sheba MaAsLin3 top 15 (Response, abundance) ==========\n")
+print(ml_sheba_res %>% 
+      filter(metadata == "Response", model == "abundance") %>%
+      arrange(pval_individual) %>% 
+      select(feature, coef, pval_individual, qval_individual) %>%
+      head(15), n = 15)
+
+cat("\n========== Pitt MaAsLin3 top 15 (Response, abundance) ==========\n")
+print(ml_pitt_res %>% 
+      filter(metadata == "Response", model == "abundance") %>%
+      arrange(pval_individual) %>% 
+      select(feature, coef, pval_individual, qval_individual) %>%
+      head(15), n = 15)
+
+cat("\n========== Sheba MaAsLin3 top 15 (Response, prevalence) ==========\n")
+print(ml_sheba_res %>% 
+      filter(metadata == "Response", model == "prevalence") %>%
+      arrange(pval_individual) %>% 
+      select(feature, coef, pval_individual, qval_individual) %>%
+      head(15), n = 15)
+
+cat("\n========== Pitt MaAsLin3 top 15 (Response, prevalence) ==========\n")
+print(ml_pitt_res %>% 
+      filter(metadata == "Response", model == "prevalence") %>%
+      arrange(pval_individual) %>% 
+      select(feature, coef, pval_individual, qval_individual) %>%
+      head(15), n = 15)
+
+# ---- LinDA -------------------------------------------------------------
+
+run_linda_path <- function(mat_f, sample_table, formula_rhs) {
+  feat <- as.data.frame(mat_f)
+  meta <- as.data.frame(sample_table)
+  shared <- intersect(colnames(feat), rownames(meta))
+  feat <- feat[, shared, drop = FALSE]
+  meta <- meta[shared, , drop = FALSE]
+  
+  MicrobiomeStat::linda(
+    feature.dat       = feat,
+    meta.dat          = meta,
+    formula           = paste("~", formula_rhs),
+    feature.dat.type  = "proportion",
+    prev.filter       = 0,           # already filtered
+    mean.abund.filter = 0,
+    adaptive          = TRUE,
+    p.adj.method      = "BH",
+    alpha             = 0.10
+  )
+}
+
+ld_path_sheba <- run_linda_path(path_sheba_f, sheba_qc$sample_table,
+                                "Response + Treatment_regimen")
+ld_path_pitt  <- run_linda_path(path_pitt_f,  pitt_qc$sample_table,
+                                "Response + Sequencing_Batch + Treatment_regimen")
+
+ld_s <- as.data.frame(ld_path_sheba$output[[
+  grep("Response", names(ld_path_sheba$output), value = TRUE)[1]]]) %>%
+  rownames_to_column("pathway") %>% arrange(pvalue)
+ld_p <- as.data.frame(ld_path_pitt$output[[
+  grep("Response", names(ld_path_pitt$output),  value = TRUE)[1]]]) %>%
+  rownames_to_column("pathway") %>% arrange(pvalue)
+
+cat("\n========== LinDA Sheba top 15 ==========\n")
+print(as.data.frame(ld_s %>% select(pathway, log2FoldChange, pvalue, padj) %>% head(15)))
+cat("\n========== LinDA Pitt top 15 ==========\n")
+print(as.data.frame(ld_p %>% select(pathway, log2FoldChange, pvalue, padj) %>% head(15)))
+
+
+# ---- ALDEx2 ------------------------------------------------------------
+# ALDEx2 wants integer-like counts. Pathway relab values are 0–1; we scale by
+# a constant (1e6 → CPM-like) and round. Per-sample column sums become equal
+# (1e6) which doesn't bother ALDEx2's CLR transform.
+
+run_aldex2_path <- function(mat_f, sample_table, scale_to = 1e6) {
+  shared <- intersect(colnames(mat_f), rownames(sample_table))
+  mat_f  <- mat_f[, shared, drop = FALSE]
+  cond   <- as.character(sample_table[shared, "Response"])
+  
+  counts <- round(mat_f * scale_to)
+  counts <- counts[rowSums(counts) > 0, , drop = FALSE]
+  
+  set.seed(42)
+  # Step 1: CLR Monte Carlo instances
+  clr <- ALDEx2::aldex.clr(counts, conds = cond, mc.samples = 128, denom = "all")
+  # Step 2: t-test (gives we.ep, we.eBH, wi.ep, wi.eBH)
+  tt  <- ALDEx2::aldex.ttest(clr, paired.test = FALSE, verbose = FALSE)
+  # Step 3: effect sizes (gives diff.btw, diff.win, effect, overlap)
+  ef  <- ALDEx2::aldex.effect(clr, verbose = FALSE)
+  # Merge
+  ax  <- cbind(ef, tt)
+  ax$pathway  <- rownames(ax)
+  ax$passes_q <- ax$we.eBH < 0.10
+  
+  ax %>%
+    select(pathway, diff_btw = diff.btw, diff_win = diff.win,
+           effect, overlap, we.ep, we.eBH, wi.ep, wi.eBH, passes_q) %>%
+    arrange(we.ep)
+}
+
+ax_path_sheba <- run_aldex2_path(path_sheba_f, sheba_qc$sample_table)
+ax_path_pitt  <- run_aldex2_path(path_pitt_f,  pitt_qc$sample_table)
+
+# ---- Quick-look summaries ----------------------------------------------
+cat("\n========== MaAsLin3 q<0.10 hits ==========\n")
+cat("Sheba abundance:",
+    sum(ml_sheba_res$model == "abundance" & ml_sheba_res$metadata == "Response"
+        & ml_sheba_res$qval_individual < 0.10, na.rm = TRUE), "\n")
+cat("Pitt  abundance:",
+    sum(ml_pitt_res$model == "abundance"  & ml_pitt_res$metadata == "Response"
+        & ml_pitt_res$qval_individual < 0.10, na.rm = TRUE), "\n")
+
+cat("\n========== LinDA q<0.10 hits ==========\n")
+
+cat("Sheba:", sum(ld_s$padj < 0.10, na.rm = TRUE), "\n")
+cat("Pitt :", sum(ld_p$padj < 0.10, na.rm = TRUE), "\n")
+
+cat("\n========== ALDEx2 q<0.10 hits (welch) ==========\n")
+cat("Sheba:", sum(ax_path_sheba$passes_q, na.rm = TRUE), "\n")
+cat("Pitt :", sum(ax_path_pitt$passes_q,  na.rm = TRUE), "\n")
+
+cat("\n========== Top 10 by p across methods (Sheba) ==========\n")
+print(head(ax_path_sheba , 10))
+cat("\n========== Top 10 by p across methods (Pitt) ==========\n")
+print(head(ax_path_pitt , 10))
+
+
+```
+# ============================================================================
+# §9.5  Pathway figures (9A)
+# ============================================================================
+```{r}
+
+library(ComplexHeatmap)
+library(circlize)
+library(tidyverse)
+
+# ---- Shared infrastructure -----------------------------------------------
+
+clr_pathway <- function(mat) {
+  pc <- min(mat[mat > 0]) / 2
+  log_mat <- log(mat + pc)
+  apply(log_mat, 2, function(z) z - mean(z))
+}
+
+clr_pitt_path  <- clr_pathway(path_pitt_f)
+clr_sheba_path <- clr_pathway(path_sheba_f)
+
+# Column annotation in shared sample order (Cohort × Response)
+col_anno_path <- bind_rows(
+  data.frame(SampleID = colnames(path_sheba_f), Cohort = "Sheba",
+             Response = as.character(sheba_qc$sample_table[colnames(path_sheba_f), "Response"]),
+             stringsAsFactors = FALSE),
+  data.frame(SampleID = colnames(path_pitt_f),  Cohort = "Pitt",
+             Response = as.character(pitt_qc$sample_table[colnames(path_pitt_f), "Response"]),
+             stringsAsFactors = FALSE)
+) %>%
+  mutate(grp = factor(paste(Cohort, Response, sep = "_"),
+                      levels = c("Sheba_Non_responder", "Sheba_Responder",
+                                 "Pitt_Non_responder",  "Pitt_Responder"))) %>%
+  arrange(grp)
+
+response_col  <- c(Non_responder = "#e31a1c", Responder = "#1f78b4")
+clr_palette   <- colorRamp2(c(-2, 0, 2), c("#2166ac", "#f7f7f7", "#b2182b"))
+ha_top_min    <- HeatmapAnnotation(
+  Response = col_anno_path$Response,
+  col = list(Response = response_col),
+  annotation_name_side = "left"
+)
+
+align_pathways <- function(clr_mat, feats) {
+  out <- matrix(NA_real_, nrow = length(feats), ncol = ncol(clr_mat),
+                dimnames = list(feats, colnames(clr_mat)))
+  ix <- intersect(feats, rownames(clr_mat))
+  out[ix, ] <- clr_mat[ix, ]
+  out
+}
+
+# Strip "PWY-NNNN: " or "PWYNNNN-PWY: " prefixes from display names
+shorten_pwy <- function(x) {
+  sub("^[^:]+: *", "", x)
+}
+
+# ============================================================================
+# §9.5  Pathway figures — 9A: cohort-distinct + bilateral pathway heatmap
+# ============================================================================
+# Three row blocks:
+#   - Sheba-only:  Suggestive+ in Sheba (≥2 methods p<0.05, concordant), not in Pitt
+#   - Bilateral:   ≥1 method p<0.10 in BOTH cohorts, concordant direction
+#   - Pitt-only:   Suggestive+ in Pitt, not in Sheba
+# Bilateral takes precedence over single-cohort blocks for any overlap.
+# ============================================================================
+
+library(ComplexHeatmap)
+library(circlize)
+library(tidyverse)
+
+# ---- Per-cohort consensus from the 3 methods ------------------------------
+
+ml_pitt_abund  <- ml_pitt_res  %>% filter(metadata == "Response", model == "abundance")
+ml_sheba_abund <- ml_sheba_res %>% filter(metadata == "Response", model == "abundance")
+
+pathway_consensus <- function(ml_df, ld_df, ax_df) {
+  ml <- ml_df %>% transmute(pathway = feature, ml_p = pval_individual,
+                             ml_q = qval_individual, ml_sign = sign(coef))
+  ld <- ld_df %>% transmute(pathway, ld_p = pvalue, ld_q = padj,
+                             ld_sign = sign(log2FoldChange))
+  ax <- ax_df %>% transmute(pathway, ax_p = we.ep, ax_q = we.eBH,
+                             ax_sign = sign(effect))
+  full_join(ml, ld, by = "pathway") %>%
+    full_join(ax, by = "pathway") %>%
+    mutate(
+      n_p05 = (replace_na(ml_p, 1) < 0.05) +
+              (replace_na(ld_p, 1) < 0.05) +
+              (replace_na(ax_p, 1) < 0.05),
+      n_p10 = (replace_na(ml_p, 1) < 0.10) +
+              (replace_na(ld_p, 1) < 0.10) +
+              (replace_na(ax_p, 1) < 0.10),
+      n_pos = replace_na(ml_sign > 0, FALSE) +
+              replace_na(ld_sign > 0, FALSE) +
+              replace_na(ax_sign > 0, FALSE),
+      n_neg = replace_na(ml_sign < 0, FALSE) +
+              replace_na(ld_sign < 0, FALSE) +
+              replace_na(ax_sign < 0, FALSE),
+      direction = case_when(
+        n_pos > 0 & n_neg == 0 ~ "R-enriched",
+        n_neg > 0 & n_pos == 0 ~ "NR-enriched",
+        TRUE                    ~ "mixed"
+      ),
+      tier = case_when(
+        n_p05 >= 2 & direction != "mixed" ~ "Suggestive",
+        n_p05 >= 1                         ~ "Nominal",
+        TRUE                                ~ "None"
+      )
+    )
+}
+
+con_path_pitt  <- pathway_consensus(ml_pitt_abund,  ld_p, ax_path_pitt)
+con_path_sheba <- pathway_consensus(ml_sheba_abund, ld_s, ax_path_sheba)
+
+# ---- Build the three row blocks -------------------------------------------
+
+# Within-cohort Suggestive+ (strict bar: ≥2 methods p<0.05, concordant)
+s_suggestive <- con_path_sheba %>% filter(tier == "Suggestive") %>%
+  transmute(pathway, source = "Sheba_sugg")
+p_suggestive <- con_path_pitt  %>% filter(tier == "Suggestive") %>%
+  transmute(pathway, source = "Pitt_sugg")
+
+# Cross-cohort Bilateral-Nominal (looser bar: ≥1 method p<0.10 in both,
+# concordant direction).
+bilateral_nom_tbl <- inner_join(
+  con_path_sheba %>% filter(n_p10 >= 1) %>% select(pathway, dir_S = direction),
+  con_path_pitt  %>% filter(n_p10 >= 1) %>% select(pathway, dir_P = direction),
+  by = "pathway"
+) %>%
+  filter(dir_S == dir_P, dir_S != "mixed") %>%
+  transmute(pathway, source = "Bilateral_nom")
+
+cat("\nBilateral-Nominal pathways (≥1 method p<0.10 in both cohorts, concordant):",
+    nrow(bilateral_nom_tbl), "\n")
+print(bilateral_nom_tbl$pathway)
+
+# Combine; Bilateral takes precedence over single-cohort entries
+feat_path_tbl <- bind_rows(
+  bilateral_nom_tbl,
+  s_suggestive %>% filter(!pathway %in% bilateral_nom_tbl$pathway),
+  p_suggestive %>% filter(!pathway %in% bilateral_nom_tbl$pathway)
+) %>%
+  distinct(pathway, .keep_all = TRUE) %>%
+  mutate(block = case_when(
+    source == "Bilateral_nom" ~ "Bilateral",
+    source == "Sheba_sugg"    ~ "Sheba-only",
+    source == "Pitt_sugg"     ~ "Pitt-only"
+  ))
+
+cat("\nPathway evidence blocks:\n")
+print(table(feat_path_tbl$block, useNA = "ifany"))
+
+# ---- Order rows within each block by R-vs-NR strength ---------------------
+
+row_strength_pwy <- function(pwy, cohort_clr, sample_table) {
+  if (!pwy %in% rownames(cohort_clr)) return(NA_real_)
+  v <- cohort_clr[pwy, ]
+  resp <- sample_table$Response[match(names(v), rownames(sample_table))]
+  mean(v[resp == "Responder"], na.rm = TRUE) -
+    mean(v[resp == "Non_responder"], na.rm = TRUE)
+}
+
+feat_path_tbl <- feat_path_tbl %>%
+  rowwise() %>%
+  mutate(strength = case_when(
+    block == "Sheba-only" ~ row_strength_pwy(pathway, clr_sheba_path,
+                                              as.data.frame(sheba_qc$sample_table)),
+    block == "Pitt-only"  ~ row_strength_pwy(pathway, clr_pitt_path,
+                                              as.data.frame(pitt_qc$sample_table)),
+    block == "Bilateral"  ~ (row_strength_pwy(pathway, clr_sheba_path,
+                                                as.data.frame(sheba_qc$sample_table)) +
+                              row_strength_pwy(pathway, clr_pitt_path,
+                                                as.data.frame(pitt_qc$sample_table))) / 2
+  )) %>%
+  ungroup() %>%
+  arrange(factor(block, levels = c("Sheba-only", "Bilateral", "Pitt-only")),
+          desc(strength))
+
+features_9A <- feat_path_tbl$pathway
+
+# ---- Build CLR z-score matrix ---------------------------------------------
+
+mat_9A  <- cbind(align_pathways(clr_sheba_path, features_9A),
+                 align_pathways(clr_pitt_path,  features_9A))[, col_anno_path$SampleID]
+mat_9Az <- t(scale(t(mat_9A)))
+rownames(mat_9Az) <- shorten_pwy(rownames(mat_9Az))
+
+# ---- Heatmap --------------------------------------------------------------
+
+ht_9A <- Heatmap(
+  mat_9Az,
+  name = "CLR z-score",
+  col  = clr_palette,
+  na_col = "#dddddd",
+  top_annotation = ha_top_min,
+  column_split   = col_anno_path$grp,
+  row_split      = factor(feat_path_tbl$block,
+                          levels = c("Sheba-only", "Bilateral", "Pitt-only")),
+  cluster_columns       = FALSE, cluster_column_slices = FALSE,
+  cluster_rows          = FALSE, cluster_row_slices    = FALSE,
+  show_column_names = FALSE,
+  row_names_side    = "right",
+  row_names_gp      = gpar(fontsize = 8),
+  row_title_gp      = gpar(fontsize = 11, fontface = "bold"),
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  heatmap_legend_param = list(direction = "horizontal")
+)
+
+fig_height <- max(5, 0.25 * nrow(mat_9Az) + 2)
+
+svg(file.path(paths$out_dir, "heatmap_pathway_cohort_distinct.svg"),
+    width = 14, height = fig_height)
+draw(ht_9A, merge_legend = TRUE, heatmap_legend_side = "bottom")
+dev.off()
+
+png(file.path(paths$out_dir, "heatmap_pathway_cohort_distinct.png"),
+    width = 14, height = fig_height, units = "in", res = 300)
+draw(ht_9A, merge_legend = TRUE, heatmap_legend_side = "bottom")
+dev.off()
+
+cat("\nSaved:\n",
+    "  heatmap_pathway_cohort_distinct.[svg|png]\n")
+```
+
+```{r}
+# 10. Combined microtable
+# ============================================================================
+# §10  Combined microtable + combined pathway data
+# ============================================================================
+# Builds two combined data objects on the QC-filtered cohort sets:
+#   combo_genus    — microeco microtable, n=103, taxa collapsed to bare genus
+#   combo_path     — list with $unstrat (relab matrix) and per-cohort metadata
+#
+# Both use sheba_qc (n=33) and pitt_qc (n=70) as primary, mirroring the per-
+# cohort analyses (locked decision #3).
+# ============================================================================
+
+library(tidyverse)
+library(microeco)
+
+# ---- §10a Combined genus microtable --------------------------------------
+
+collapse_to_bare_genus <- function(m) {
+  # Returns a list of (otu_table, sample_table, tax_table) with rows keyed by
+  # bare genus name (stripped of full lineage). Per locked decision #9 we drop
+  # placeholder genera before any analysis.
+  ot <- as.data.frame(m$otu_table)
+  ot$bare <- sub(".*\\|", "", rownames(ot))
+  ot <- ot %>%
+    group_by(bare) %>%
+    summarise(across(everything(), sum), .groups = "drop") %>%
+    column_to_rownames("bare")
+  
+  st <- as.data.frame(m$sample_table)
+  
+  # Build a minimal tax table at genus level
+  tx <- data.frame(Genus = rownames(ot), row.names = rownames(ot),
+                   stringsAsFactors = FALSE)
+  
+  list(otu = ot, sample = st, tax = tx)
+}
+
+combine_meco_genus <- function(m_a, m_b, label_a = "Sheba", label_b = "Pitt") {
+
+  # ---- sample_table prep ---------------------------------------------
+  prep_sm <- function(m, cohort_label) {
+    sm <- as.data.frame(m$sample_table)
+    if ("SampleID" %in% colnames(sm)) sm$SampleID <- NULL          # avoid collision
+    if (!"Cohort" %in% colnames(sm)) sm$Cohort <- cohort_label
+    if (!"Treatment_regimen" %in% colnames(sm))
+      sm$Treatment_regimen <- NA_character_
+    rownames_to_column(sm, "SampleID")
+  }
+
+  # ---- bare-genus OTU matrix -----------------------------------------
+  # Sheba is species-level lineage, Pitt is genus-level lineage. Strip to
+  # last token (g__X) and sum any duplicates so the join keys match.
+  prep_otu_genus <- function(m, cohort_label) {
+    src <- if (!is.null(m$taxa_abund) && !is.null(m$taxa_abund$Genus))
+             m$taxa_abund$Genus else m$otu_table
+    ga  <- as.data.frame(src)
+    bare <- sub(".*\\|", "", rownames(ga))
+    ga  <- as.data.frame(rowsum(as.matrix(ga), group = bare))      # collapse-then-sum
+    cat("[", cohort_label, "] genus-collapsed: ", nrow(ga),
+        " genera × ", ncol(ga), " samples\n", sep = "")
+    rownames_to_column(ga, "Genus")
+  }
+
+  ot_a <- prep_otu_genus(m_a, label_a)
+  ot_b <- prep_otu_genus(m_b, label_b)
+
+  otu <- full_join(ot_a, ot_b, by = "Genus") %>% column_to_rownames("Genus")
+  otu[is.na(otu)] <- 0
+
+  # ---- sample_table merge --------------------------------------------
+  sm_a <- prep_sm(m_a, label_a)
+  sm_b <- prep_sm(m_b, label_b)
+
+  shared_cols <- intersect(colnames(sm_a), colnames(sm_b))
+  cat("\nShared sample_table columns (", length(shared_cols), "):\n  ",
+      paste(shared_cols, collapse = ", "), "\n\n", sep = "")
+  # ---- type harmonization on shared columns ---------------------------
+  # bind_rows fails on type mismatches; coerce to character when classes differ
+  for (col in shared_cols) {
+    if (!identical(class(sm_a[[col]]), class(sm_b[[col]]))) {
+      cat("  ! type mismatch on '", col, "' (",
+          class(sm_a[[col]])[1], " vs ", class(sm_b[[col]])[1],
+          ") — coercing to character\n", sep = "")
+      sm_a[[col]] <- as.character(sm_a[[col]])
+      sm_b[[col]] <- as.character(sm_b[[col]])
+    }
+  }
+  required <- c("SampleID", "Response", "Cohort", "Treatment_regimen")
+  missing  <- setdiff(required, shared_cols)
+  if (length(missing))
+    stop("Missing required column(s) after harmonization: ",
+         paste(missing, collapse = ", "))
+
+  sm <- bind_rows(sm_a, sm_b) %>% column_to_rownames("SampleID")
+  sm <- sm[colnames(otu), , drop = FALSE]
+
+  # ---- tax_table (genus-level minimal, w/ upper ranks where coalescible)
+  pull_tx <- function(m) {
+    tx <- as.data.frame(m$tax_table)
+    if (!"Genus" %in% colnames(tx)) return(NULL)
+    tx$Genus_bare <- sub(".*\\|", "", tx$Genus)
+    # pick first row per Genus_bare for upper-rank lookup
+    tx[!duplicated(tx$Genus_bare), , drop = FALSE]
+  }
+  tx_a <- pull_tx(m_a); tx_b <- pull_tx(m_b)
+  tx <- data.frame(Genus_bare = rownames(otu), stringsAsFactors = FALSE) %>%
+    left_join(tx_a %>% select(Genus_bare, any_of(c("Kingdom","Phylum","Class","Order","Family"))),
+              by = "Genus_bare", suffix = c("", ".a")) %>%
+    left_join(tx_b %>% select(Genus_bare, any_of(c("Kingdom","Phylum","Class","Order","Family"))),
+              by = "Genus_bare", suffix = c(".a", ".b")) %>%
+    mutate(Kingdom = coalesce(Kingdom.a, Kingdom.b),
+           Phylum  = coalesce(Phylum.a,  Phylum.b),
+           Class   = coalesce(Class.a,   Class.b),
+           Order   = coalesce(Order.a,   Order.b),
+           Family  = coalesce(Family.a,  Family.b),
+           Genus   = Genus_bare) %>%
+    select(Genus, Kingdom, Phylum, Class, Order, Family) %>%
+    column_to_rownames("Genus")
+  tx <- tx[rownames(otu), , drop = FALSE]
+  tx$Genus <- rownames(tx)   # microeco wants Genus column present
+
+  m <- microtable$new(otu_table = otu, sample_table = sm, tax_table = tx)
+  m$tidy_dataset()
+  m
+}
+
+combo_genus <- combine_meco_genus(sheba_f, pitt_f)
+combo_genus$sample_table$Cohort   <- factor(combo_genus$sample_table$Cohort)
+combo_genus$sample_table$Response <- factor(combo_genus$sample_table$Response,
+                                            levels = c("Non_responder", "Responder"))
+combo_genus$sample_table$Treatment_regimen <- factor(combo_genus$sample_table$Treatment_regimen)
+
+cat("Combined microtable: ", nrow(combo_genus$otu_table), " genera × ",
+    ncol(combo_genus$otu_table), " samples\n", sep = "")
+cat("\nCohort × Response:\n");
+print(with(combo_genus$sample_table, table(Cohort, Response)))
+cat("\nCohort × Treatment_regimen:\n")
+print(with(combo_genus$sample_table, table(Cohort, Treatment_regimen, useNA = "ifany")))
+cat("\nFirst 5 genera:\n")
+print(head(rownames(combo_genus$otu_table), 5))
+
+filter_combined_genus <- function(m,
+                                  prev_thresh    = PARAMS$prevalence_threshold,
+                                  abund_thresh   = PARAMS$abundance_threshold,
+                                  placeholder_re = "^g__(GGB|FGB|OFGB|CFGB)") {
+  otu <- as.matrix(m$otu_table)
+  sm  <- as.data.frame(m$sample_table)
+
+  passes_in <- function(cohort_label) {
+    cols <- rownames(sm)[sm$Cohort == cohort_label]
+    sub  <- otu[, cols, drop = FALSE]
+    prev <- rowMeans(sub > 0)
+    mab  <- rowMeans(sub)
+    prev >= prev_thresh & mab >= abund_thresh
+  }
+
+  pass_sheba <- passes_in("Sheba")
+  pass_pitt  <- passes_in("Pitt")
+  drop_ph    <- grepl(placeholder_re, rownames(otu))
+
+  cat("Filter cascade for combined-cohort genus DA:\n")
+  cat("  starting:                       ", nrow(otu), "\n", sep = "")
+  cat("  placeholder genera (excluded):  ", sum(drop_ph), "\n", sep = "")
+  cat("  passes prev/abund in Sheba:     ", sum(pass_sheba & !drop_ph), "\n", sep = "")
+  cat("  passes prev/abund in Pitt:      ", sum(pass_pitt  & !drop_ph), "\n", sep = "")
+  cat("  in BOTH (intersection, kept):   ", sum(pass_sheba & pass_pitt & !drop_ph), "\n", sep = "")
+  cat("  Sheba-only (excluded):          ", sum(pass_sheba & !pass_pitt & !drop_ph), "\n", sep = "")
+  cat("  Pitt-only  (excluded):          ", sum(pass_pitt  & !pass_sheba & !drop_ph), "\n", sep = "")
+
+  keep <- pass_sheba & pass_pitt & !drop_ph
+  m$otu_table <- m$otu_table[keep, , drop = FALSE]
+  m$tax_table <- m$tax_table[keep, , drop = FALSE]
+  m$tidy_dataset()
+  m
+}
+
+combo_genus <- filter_combined_genus(combo_genus)
+
+cat("\nCombined microtable (post-filter): ",
+    nrow(combo_genus$otu_table), " genera × ",
+    ncol(combo_genus$otu_table), " samples\n", sep = "")
+cat("First 10 genera retained:\n")
+print(head(rownames(combo_genus$otu_table), 10))
+
+# ---- 11. Combined alpha diversity (cohort-adjusted) -------------------
+combo_genus$cal_alphadiv()
+ad <- as.data.frame(combo_genus$alpha_diversity)
+if (!"SampleID" %in% colnames(ad)) ad$SampleID <- rownames(ad)
+
+sm <- as.data.frame(combo_genus$sample_table)
+if (!"SampleID" %in% colnames(sm)) sm$SampleID <- rownames(sm)
+
+alpha_combo <- left_join(
+  ad,
+  sm[, c("SampleID", "Response", "Cohort", "Treatment_regimen")],
+  by = "SampleID"
+)
+
+# Indices microeco actually computes on relab data (Shannon/Simpson/InvSimpson;
+# Observed/Chao1/ACE/Fisher are skipped because they need integer counts).
+alpha_metrics <- intersect(c("Shannon", "Simpson", "InvSimpson", "Coverage"),
+                           colnames(alpha_combo))
+cat("Available α-indices:", paste(alpha_metrics, collapse = ", "), "\n\n")
+
+run_alpha_models <- function(metric) {
+  cat("===== ", metric, " =====\n", sep = "")
+
+  f1 <- as.formula(paste(metric, "~ Response + Cohort"))
+  f2 <- as.formula(paste(metric, "~ Response + Cohort + Treatment_regimen"))
+  fit1 <- lm(f1, data = alpha_combo)
+  fit2 <- lm(f2, data = alpha_combo)
+
+  cat("\n-- M1: ~ Response + Cohort --\n")
+  print(round(summary(fit1)$coefficients, 4))
+
+  cat("\n-- M2: ~ Response + Cohort + Treatment_regimen --\n")
+  print(round(summary(fit2)$coefficients, 4))
+
+  cat("\n-- ANOVA M2 vs M1 (does Treatment_regimen add information?) --\n")
+  print(anova(fit1, fit2))
+
+  invisible(list(M1 = fit1, M2 = fit2))
+}
+
+alpha_fits <- lapply(alpha_metrics, run_alpha_models)
+names(alpha_fits) <- alpha_metrics
+
+# Compact summary across metrics
+cat("\n===== Compact summary =====\n")
+summary_tab <- do.call(rbind, lapply(alpha_metrics, function(m) {
+  c1 <- summary(alpha_fits[[m]]$M1)$coefficients
+  c2 <- summary(alpha_fits[[m]]$M2)$coefficients
+  data.frame(
+    Metric            = m,
+    Resp_p_M1         = round(c1["ResponseResponder", "Pr(>|t|)"], 4),
+    Resp_beta_M1      = round(c1["ResponseResponder", "Estimate"],  4),
+    Cohort_p_M1       = round(c1["CohortPitt",        "Pr(>|t|)"], 4),
+    Resp_p_M2         = round(c2["ResponseResponder", "Pr(>|t|)"], 4),
+    Trt_p_M2          = round(c2[grep("Treatment_regimen", rownames(c2))[1], "Pr(>|t|)"], 4),
+    AnovaP_M1_vs_M2   = round(anova(alpha_fits[[m]]$M1, alpha_fits[[m]]$M2)$`Pr(>F)`[2], 4),
+    stringsAsFactors  = FALSE
+  )
+}))
+print(summary_tab)
+
+write_tsv(summary_tab, file.path(paths$out_dir, "alpha_combined_summary.tsv"))
+```
+
+#### Beta-diversity
+```{r}
+
+# ---- 12. Combined beta diversity -------------------------------------
+run_beta <- function(method_label, dist_method) {
+  cat("\n========  ", method_label, "  ========\n", sep = "")
+
+  otu_t <- t(as.matrix(combo_genus$otu_table))
+
+  if (dist_method == "aitchison") {
+    # vegan::vegdist adds pseudocount internally; pseudocount=1 is fine for
+    # percentage-scale relab data. If your otu_table is on proportion scale,
+    # the result is invariant up to a constant — relative ordering preserved.
+    d <- vegan::vegdist(otu_t, method = "aitchison", pseudocount = 1)
+  } else {
+    d <- vegan::vegdist(otu_t, method = "bray")
+  }
+
+  sm <- as.data.frame(combo_genus$sample_table)
+  sm <- sm[labels(d), , drop = FALSE]
+
+  # Marginal PERMANOVA — matches §13 covariate set
+  set.seed(42)
+  ad_marg <- vegan::adonis2(
+    d ~ Response + Cohort + Treatment_regimen, data = sm,
+    permutations = PARAMS$permanova_perms, by = "margin"
+  )
+  cat("\n-- Marginal PERMANOVA (Response + Cohort + Treatment_regimen) --\n")
+  print(ad_marg)
+
+  # Cohort-stratified PERMANOVA — within-cohort Response signal
+  set.seed(42)
+  ad_strat <- vegan::adonis2(
+    d ~ Response, data = sm, strata = sm$Cohort,
+    permutations = PARAMS$permanova_perms
+  )
+  cat("\n-- Stratified PERMANOVA (Response | Cohort strata) --\n")
+  print(ad_strat)
+
+  # PERMDISP — does Cohort or Response have heterogeneous dispersion?
+  set.seed(42)
+  pd_coh <- vegan::permutest(vegan::betadisper(d, sm$Cohort),
+                             permutations = PARAMS$permanova_perms)
+  set.seed(42)
+  pd_res <- vegan::permutest(vegan::betadisper(d, sm$Response),
+                             permutations = PARAMS$permanova_perms)
+  cat("\n-- PERMDISP --\n")
+  cat("Cohort:   F=", round(pd_coh$tab$F[1], 3),
+      "  p=", round(pd_coh$tab$`Pr(>F)`[1], 4), "\n", sep = "")
+  cat("Response: F=", round(pd_res$tab$F[1], 3),
+      "  p=", round(pd_res$tab$`Pr(>F)`[1], 4), "\n", sep = "")
+
+  # PCoA
+  ord <- ape::pcoa(d)
+  eig <- 100 * ord$values$Relative_eig
+  pcoa_df <- data.frame(PC1 = ord$vectors[, 1], PC2 = ord$vectors[, 2]) %>%
+    rownames_to_column("SampleID") %>%
+    left_join(rownames_to_column(sm, "SampleID"), by = "SampleID")
+
+  p <- ggplot(pcoa_df, aes(PC1, PC2, color = Response, shape = Cohort)) +
+    geom_point(size = 3, alpha = 0.85) +
+    stat_ellipse(aes(group = Response), type = "t", level = 0.8) +
+    scale_color_manual(values = c("Non_responder" = "#ff7f00",
+                                  "Responder"     = "#6a3d9a")) +
+    scale_shape_manual(values = c("Sheba" = 16, "Pitt" = 17)) +
+    labs(x = sprintf("PCo1 (%.1f%%)", eig[1]),
+         y = sprintf("PCo2 (%.1f%%)", eig[2]),
+         title = sprintf("Combined PCoA — %s", method_label)) +
+    theme_bw(base_size = 12)
+
+  ggsave(file.path(paths$out_dir,
+                   sprintf("beta_diversity_combined_%s.svg", dist_method)),
+         p, width = 7, height = 5)
+
+  list(dist = d, ad_marg = ad_marg, ad_strat = ad_strat,
+       pd_coh = pd_coh, pd_res = pd_res, plot = p)
+}
+
+beta_aitch <- run_beta("Aitchison (primary)",      "aitchison")
+beta_bray  <- run_beta("Bray-Curtis (sensitivity)", "bray")
+
+# Cross-metric summary (just the marginal model)
+quick <- data.frame(
+  Metric  = c("Aitchison", "Bray-Curtis"),
+  Resp_R2 = c(beta_aitch$ad_marg["Response", "R2"],
+              beta_bray $ad_marg["Response", "R2"]),
+  Resp_p  = c(beta_aitch$ad_marg["Response", "Pr(>F)"],
+              beta_bray $ad_marg["Response", "Pr(>F)"]),
+  Coh_R2  = c(beta_aitch$ad_marg["Cohort",   "R2"],
+              beta_bray $ad_marg["Cohort",   "R2"]),
+  Coh_p   = c(beta_aitch$ad_marg["Cohort",   "Pr(>F)"],
+              beta_bray $ad_marg["Cohort",   "Pr(>F)"]),
+  Trt_R2  = c(beta_aitch$ad_marg["Treatment_regimen", "R2"],
+              beta_bray $ad_marg["Treatment_regimen", "R2"]),
+  Trt_p   = c(beta_aitch$ad_marg["Treatment_regimen", "Pr(>F)"],
+              beta_bray $ad_marg["Treatment_regimen", "Pr(>F)"])
+)
+quick[, -1] <- round(quick[, -1], 4)
+cat("\n======== Cross-metric marginal summary ========\n"); print(quick)
+
+print(beta_aitch$plot)
+print(beta_bray$plot)
+
+
+```
+
+```{r}
+# ---- 13. Combined differential abundance (3 methods) ------------------
+# Covariate set: Response + Cohort + Treatment_regimen (locked decision #2)
+# All three methods take all three covariates; ALDEx2 via aldex.glm so it
+# adjusts (per-cohort §7 used unadjusted aldex.ttest as triangulation; the
+# combined model needs covariate adjustment because Cohort is so dominant).
+
+# --- 13a. MaAsLin3 -----------------------------------------------------
+# run_maaslin3_v4 already subsets metadata to formula columns (handoff fix #4)
+# Populate the missing slot before the wrapper call
+combo_genus$cal_abund()
+cat("Genera in taxa_abund$Genus: ", nrow(combo_genus$taxa_abund$Genus),
+    "  (should match otu_table: ", nrow(combo_genus$otu_table), ")\n", sep = "")
+
+# Now retry MaAsLin3
+m3_combined <- run_maaslin3_v4(
+  combo_genus,
+  output_dir              = file.path(paths$out_dir, "maaslin3_combined_genus"),
+  fixed_effects           = c("Response", "Cohort", "Treatment_regimen"),
+  reference               = "Response,Non_responder;Cohort,Sheba;Treatment_regimen,anti-PD1",
+  drop_placeholder_genera = FALSE
+)
+m3_res <- m3_combined$fit_data_abundance$results %>%
+  filter(metadata == "Response") %>%
+  arrange(qval_individual)
+cat("MaAsLin3 q<0.10 hits:", sum(m3_res$qval_individual < 0.10), "\n")
+
+# --- 13b. LinDA --------------------------------------------------------
+otu_mat <- as.data.frame(combo_genus$otu_table)
+sm_combo <- as.data.frame(combo_genus$sample_table)
+
+ld_combined <- MicrobiomeStat::linda(
+  feature.dat       = otu_mat,
+  meta.dat          = sm_combo,
+  formula           = "~ Response + Cohort + Treatment_regimen",
+  feature.dat.type  = "proportion",
+  prev.filter       = 0,            # already filtered upstream
+  mean.abund.filter = 0,
+  adaptive          = TRUE,
+  p.adj.method      = "BH",
+  alpha             = 0.10
+)
+ld_res <- ld_combined$output$ResponseResponder %>%
+  rownames_to_column("feature") %>%
+  arrange(pvalue)
+cat("LinDA q<0.10 hits:", sum(ld_res$padj < 0.10, na.rm = TRUE), "\n")
+
+# --- 13c. ALDEx2 (covariate-adjusted via aldex.glm) --------------------
+# aldex.glm needs integer-ish counts. relab × 1e6 + small pseudocount is the
+# standard workaround for proportional input — preserves ratios exactly under
+# CLR, only the constant changes.
+counts_pseudo <- round(otu_mat * 1e6) + 1L
+mm <- model.matrix(~ Response + Cohort + Treatment_regimen, data = sm_combo)
+
+set.seed(42)
+ax_clr <- ALDEx2::aldex.clr(counts_pseudo, mm, mc.samples = 128, denom = "all")
+ax_glm <- ALDEx2::aldex.glm(ax_clr, mm)
+
+# Pull the Response coefficient block (column names follow aldex.glm convention)
+resp_col <- grep("ResponseResponder.*pval\\.holm$|ResponseResponder.*pval\\.padj$|ResponseResponder.*BH",
+                 colnames(ax_glm), value = TRUE)
+cat("ALDEx2 columns matching Response:\n"); print(resp_col)
+
+# Defensive extraction — exact column names depend on ALDEx2 version
+ax_res <- data.frame(
+  feature  = rownames(ax_glm),
+  estimate = ax_glm[, "ResponseResponder:Est"],
+  stderr   = ax_glm[, "ResponseResponder:SE"],
+  tval     = ax_glm[, "ResponseResponder:t.val"],
+  pvalue   = ax_glm[, "ResponseResponder:pval"],
+  padj     = ax_glm[, "ResponseResponder:pval.padj"],
+  stringsAsFactors = FALSE
+) %>% arrange(pvalue)
+
+cat("ALDEx2 q<0.10 hits:    ", sum(ax_res$padj   < 0.10, na.rm = TRUE), "\n")
+cat("ALDEx2 raw p<0.05 hits:", sum(ax_res$pvalue < 0.05, na.rm = TRUE), "\n\n")
+print(head(ax_res, 10))
+
+write_tsv(ax_res, file.path(paths$out_dir, "DA_combined_aldex2.tsv"))
+
+# --- Save all three for §13.5 ------------------------------------------
+write_tsv(m3_res, file.path(paths$out_dir, "DA_combined_maaslin3.tsv"))
+write_tsv(ld_res, file.path(paths$out_dir, "DA_combined_linda.tsv"))
+write_tsv(ax_res, file.path(paths$out_dir, "DA_combined_aldex2.tsv"))
+
+# --- Quick top-10 each method ------------------------------------------
+cat("\n=== MaAsLin3 top 10 by q ===\n")
+print(m3_res %>% select(feature, coef, stderr, pval_individual, qval_individual) %>% head(10))
+cat("\n=== LinDA top 10 by p ===\n")
+print(ld_res   %>% select(feature, log2FoldChange, lfcSE, pvalue, padj)        %>% head(10))
+cat("\n=== ALDEx2 top 10 by p ===\n")
+print(ax_res   %>% head(10))
+
+# §13.5a — Genus-level verification table (Slackia/Eggerthella/Lachnospira)
+genus_targets <- c("g__Slackia", "g__Eggerthella", "g__Lachnospira")
+
+# §7-derived expectations (from handoff)
+expected <- tribble(
+  ~feature,         ~per_cohort_tier,                                    ~expected_dir,
+  "g__Slackia",     "Moderate: LinDA q=0.06 Sheba, MaAsLin3 prev p=0.0098 Sheba; Pitt directionally consistent p=0.5",  "NR",
+  "g__Eggerthella", "Bilateral nominal but sign-discordant between cohorts",                                              NA,
+  "g__Lachnospira", "Bilateral nominal, weak; direction uncertain",                                                       NA
+)
+
+m3_t <- m3_res %>% filter(feature %in% genus_targets) %>%
+  transmute(feature, m3_coef = coef, m3_p = pval_individual, m3_q = qval_individual,
+            m3_dir = ifelse(coef < 0, "NR", "R"))
+ld_t <- ld_res %>% filter(feature %in% genus_targets) %>%
+  transmute(feature, ld_lfc = log2FoldChange, ld_p = pvalue, ld_q = padj,
+            ld_dir = ifelse(log2FoldChange < 0, "NR", "R"))
+ax_t <- ax_res %>% filter(feature %in% genus_targets) %>%
+  transmute(feature, ax_est = estimate, ax_p = pvalue, ax_q = padj,
+            ax_dir = ifelse(estimate < 0, "NR", "R"))
+
+verif_genus <- expected %>%
+  left_join(m3_t, by = "feature") %>%
+  left_join(ld_t, by = "feature") %>%
+  left_join(ax_t, by = "feature") %>%
+  mutate(
+    n_q010_consistent = pmin(
+      (!is.na(m3_q) & m3_q < 0.10 & (is.na(expected_dir) | m3_dir == expected_dir)) +
+      (!is.na(ld_q) & ld_q < 0.10 & (is.na(expected_dir) | ld_dir == expected_dir)) +
+      (!is.na(ax_q) & ax_q < 0.10 & (is.na(expected_dir) | ax_dir == expected_dir)),
+      3),
+    n_p05_consistent = (
+      (!is.na(m3_p) & m3_p < 0.05 & (is.na(expected_dir) | m3_dir == expected_dir)) +
+      (!is.na(ld_p) & ld_p < 0.05 & (is.na(expected_dir) | ld_dir == expected_dir)) +
+      (!is.na(ax_p) & ax_p < 0.05 & (is.na(expected_dir) | ax_dir == expected_dir))
+    ),
+    verdict = case_when(
+      n_q010_consistent >= 1                            ~ "Replicated (locked rule)",
+      n_p05_consistent  >= 2                            ~ "Directional concordance only",
+      n_p05_consistent  == 1                            ~ "Single-method nominal",
+      TRUE                                              ~ "Null"
+    )
+  )
+
+cat("\n=== §13.5a Genus verification table ===\n")
+print(verif_genus %>% select(feature, expected_dir,
+                             m3_coef, m3_q, m3_dir,
+                             ld_lfc, ld_q, ld_dir,
+                             ax_est, ax_q, ax_dir,
+                             n_q010_consistent, n_p05_consistent, verdict),
+      width = Inf)
+
+write_tsv(verif_genus, file.path(paths$out_dir, "verification_table_genus.tsv"))
+
+```
+
+```{r}
+
+# §13b — Combined-cohort pathway DA -------------------------------------
+
+# 1. Feature universe: intersection of cohort-filtered pathways
+shared_pwy <- intersect(rownames(path_pitt_f), rownames(path_sheba_f))
+cat("Combined pathway feature set: ", length(shared_pwy), "\n", sep = "")
+
+# 2. Combined matrix
+path_combo <- cbind(
+  path_pitt_f [shared_pwy, , drop = FALSE],
+  path_sheba_f[shared_pwy, , drop = FALSE]
+)
+
+# 3. Combined metadata
+needed_cols <- c("SampleID", "Cohort", "Response", "Treatment_regimen")
+md_combo <- bind_rows(
+  as.data.frame(pitt_qc$sample_table) [, needed_cols],
+  as.data.frame(sheba_qc$sample_table)[, needed_cols]
+)
+rownames(md_combo) <- md_combo$SampleID
+
+# Align matrix and metadata by sample
+keep <- intersect(colnames(path_combo), rownames(md_combo))
+path_combo <- path_combo[, keep, drop = FALSE]
+md_combo   <- md_combo  [keep, , drop = FALSE]
+
+md_combo$Response          <- factor(md_combo$Response,
+                                     levels = c("Non_responder", "Responder"))
+md_combo$Cohort            <- factor(md_combo$Cohort,
+                                     levels = c("Sheba", "Pitt"))
+md_combo$Treatment_regimen <- factor(md_combo$Treatment_regimen,
+                                     levels = c("anti-PD1", "anti-PD1+anti-CTLA4"))
+
+cat("Combined matrix: ", nrow(path_combo), " pathways × ",
+    ncol(path_combo), " samples\n", sep = "")
+cat("\nCohort × Response:\n");          print(with(md_combo, table(Cohort, Response)))
+cat("\nCohort × Treatment_regimen:\n"); print(with(md_combo, table(Cohort, Treatment_regimen)))
+
+
+# --- 13b-i. MaAsLin3 -------------------------------------------------
+dir.create(file.path(paths$out_dir, "maaslin3_combined_pathway"),
+           recursive = TRUE, showWarnings = FALSE)
+
+m3_path <- maaslin3::maaslin3(
+  input_data        = as.data.frame(t(path_combo)),   # samples × pathways
+  input_metadata    = md_combo,
+  output            = file.path(paths$out_dir, "maaslin3_combined_pathway"),
+  fixed_effects     = c("Response", "Cohort", "Treatment_regimen"),
+  reference         = "Response,Non_responder;Cohort,Sheba;Treatment_regimen,anti-PD1",
+  normalization     = "TSS",
+  transform         = "LOG",
+  correction        = "BH",
+  min_abundance     = 0,           # pre-filtered upstream
+  min_prevalence    = 0,
+  max_significance  = 0.10,
+  cores             = 2,
+  plot_summary_plot = FALSE,
+  plot_associations = FALSE
+)
+
+m3_path_res <- m3_path$fit_data_abundance$results %>%
+  filter(metadata == "Response") %>%
+  arrange(qval_individual) %>%
+  transmute(feature,
+            m3_coef = coef,  m3_p = pval_individual,
+            m3_q    = qval_individual,
+            m3_dir  = ifelse(coef < 0, "NR", "R"))
+cat("MaAsLin3 q<0.10 pathway hits:", sum(m3_path_res$m3_q < 0.10), "\n")
+
+
+# --- 13b-ii. LinDA ---------------------------------------------------
+ld_path <- MicrobiomeStat::linda(
+  feature.dat       = path_combo,
+  meta.dat          = md_combo,
+  formula           = "~ Response + Cohort + Treatment_regimen",
+  feature.dat.type  = "proportion",
+  prev.filter       = 0,
+  mean.abund.filter = 0,
+  adaptive          = TRUE,
+  p.adj.method      = "BH",
+  alpha             = 0.10
+)
+
+ld_path_res <- ld_path$output$ResponseResponder %>%
+  rownames_to_column("feature") %>%
+  arrange(pvalue) %>%
+  transmute(feature,
+            ld_lfc = log2FoldChange, ld_p = pvalue,
+            ld_q   = padj,
+            ld_dir = ifelse(log2FoldChange < 0, "NR", "R"))
+cat("LinDA q<0.10 pathway hits:", sum(ld_path_res$ld_q < 0.10, na.rm = TRUE), "\n")
+
+
+# --- 13b-iii. ALDEx2 (aldex.glm with covariate adjustment) -----------
+counts_pseudo_path <- round(path_combo * 1e6) + 1L
+mm_path <- model.matrix(~ Response + Cohort + Treatment_regimen, data = md_combo)
+
+set.seed(42)
+ax_path_clr <- ALDEx2::aldex.clr(counts_pseudo_path, mm_path,
+                                 mc.samples = 128, denom = "all")
+ax_path_glm <- ALDEx2::aldex.glm(ax_path_clr, mm_path)
+
+ax_path_res <- data.frame(
+  feature = rownames(ax_path_glm),
+  ax_est  = ax_path_glm[, "ResponseResponder:Est"],
+  ax_p    = ax_path_glm[, "ResponseResponder:pval"],
+  ax_q    = ax_path_glm[, "ResponseResponder:pval.padj"],
+  stringsAsFactors = FALSE
+) %>%
+  mutate(ax_dir = ifelse(ax_est < 0, "NR", "R")) %>%
+  arrange(ax_p)
+cat("ALDEx2 q<0.10 pathway hits:", sum(ax_path_res$ax_q < 0.10, na.rm = TRUE), "\n")
+
+
+# --- Save & top-10 ---------------------------------------------------
+write_tsv(m3_path_res, file.path(paths$out_dir, "DA_combined_pathway_maaslin3.tsv"))
+write_tsv(ld_path_res, file.path(paths$out_dir, "DA_combined_pathway_linda.tsv"))
+write_tsv(ax_path_res, file.path(paths$out_dir, "DA_combined_pathway_aldex2.tsv"))
+
+cat("\n=== Pathway MaAsLin3 top 10 by q ===\n");  print(head(m3_path_res, 10))
+cat("\n=== Pathway LinDA top 10 by p ===\n");     print(head(ld_path_res, 10))
+cat("\n=== Pathway ALDEx2 top 10 by p ===\n");    print(head(ax_path_res, 10))
+
+```
+### 14a. Figures of combined metaphlan analysis
+```{r}
+
+# §14a — Combined genus heatmap ----------------------------------------
+# CLR-transformed genus abundances on the 105 QC'd samples (33 Sheba + 70 Pitt
+# minus the 5 QC-flagged); two evidence blocks: "§13.5a verification" and
+# "Combined-cohort novel" (multi-method directional concordance at p<0.05).
+
+# 1. Row selection ------------------------------------------------------
+verif_genus_rows <- c("g__Slackia", "g__Eggerthella", "g__Lachnospira")
+
+# Combined-cohort novel: 2-method directional concordance at p<0.05,
+# matching the §13 multi-method pattern. Pull from the three result tables.
+novel_genus_rows <- inner_join(
+  m3_res %>% transmute(feature, m3_p = pval_individual, m3_dir = ifelse(coef < 0, "NR", "R")),
+  ld_res %>% transmute(feature, ld_p = pvalue,          ld_dir = ifelse(log2FoldChange < 0, "NR", "R")),
+  by = "feature"
+) %>% inner_join(
+  ax_res %>% transmute(feature, ax_p = pvalue,          ax_dir = ifelse(estimate < 0, "NR", "R")),
+  by = "feature"
+) %>%
+  filter(!feature %in% verif_genus_rows) %>%   # don't double-count verification targets
+  mutate(
+    n_p05_concordant = (
+      (!is.na(m3_p) & m3_p < 0.05) +
+      (!is.na(ld_p) & ld_p < 0.05) +
+      (!is.na(ax_p) & ax_p < 0.05)
+    ),
+    dir_consistent = (m3_dir == ld_dir) & (ld_dir == ax_dir)
+  ) %>%
+  filter(n_p05_concordant >= 2 & dir_consistent) %>%
+  arrange(pmin(m3_p, ld_p, ax_p)) %>%
+  pull(feature)
+
+cat("Genus heatmap rows:\n")
+cat("  §13.5a verification (", length(verif_genus_rows), "): ",
+    paste(verif_genus_rows, collapse = ", "), "\n", sep = "")
+cat("  Combined novel (",      length(novel_genus_rows),  "): ",
+    paste(novel_genus_rows,  collapse = ", "), "\n", sep = "")
+
+heatmap_genera <- c(verif_genus_rows, novel_genus_rows)
+stopifnot(all(heatmap_genera %in% rownames(combo_genus$otu_table)))
+
+# 2. CLR transform on the selected rows ---------------------------------
+otu_sel <- as.matrix(combo_genus$otu_table)[heatmap_genera, , drop = FALSE]
+otu_pseudo <- otu_sel + min(otu_sel[otu_sel > 0]) / 2   # half-min pseudocount
+clr_mat <- apply(otu_pseudo, 2, function(x) log(x) - mean(log(x)))
+
+# Row z-score for visualization (already done by ComplexHeatmap row scaling
+# but we'll be explicit and pre-scale)
+clr_z <- t(scale(t(clr_mat)))
+
+# 3. Annotation ---------------------------------------------------------
+sm <- combo_genus$sample_table[colnames(clr_z), , drop = FALSE]
+col_anno <- HeatmapAnnotation(
+  Cohort   = sm$Cohort,
+  Response = sm$Response,
+  col = list(
+    Cohort    = c("Sheba" = "#1b9e77", "Pitt"  = "#7570b3"),
+    Response  = c("Non_responder" = "#ff7f00", "Responder" = "#6a3d9a")
+  ),
+  annotation_name_side = "left",
+  show_legend = TRUE
+)
+
+# 4. Row-split blocks + clean labels (strip g__ prefix) -----------------
+row_split <- factor(
+  c(rep("§13.5a verification", length(verif_genus_rows)),
+    rep("Combined-cohort novel", length(novel_genus_rows))),
+  levels = c("§13.5a verification", "Combined-cohort novel")
+)
+row_labels <- sub("^g__", "", rownames(clr_z))
+
+# 5. Build heatmap ------------------------------------------------------
+ht_genus <- Heatmap(
+  clr_z,
+  name              = "CLR\n(z-scored)",
+  top_annotation    = col_anno,
+  column_split = sm$Cohort,    # 2 panels: Sheba | Pitt
+  column_title      = NULL,
+  column_order = order(sm$Cohort, sm$Response),   # NR before R within each
+cluster_columns = FALSE,                        # respect explicit order
+  show_column_names = FALSE,
+  cluster_rows      = TRUE,
+  row_split         = row_split,
+  row_title_rot     = 90,
+  row_labels        = row_labels,
+  row_names_gp      = gpar(fontface = "italic", fontsize = 9),
+  column_gap        = unit(2, "mm"),
+  row_gap           = unit(2, "mm"),
+  border            = TRUE,
+  col               = circlize::colorRamp2(
+    c(-2, 0, 2), c("#2166ac", "white", "#b2182b")
+  )
+)
+
+# 6. Save ---------------------------------------------------------------
+svg(file.path(paths$out_dir, "heatmap_combined_genus.svg"),
+    width = 10, height = 0.45 * length(heatmap_genera) + 2.5)
+draw(ht_genus, merge_legend = TRUE)
+dev.off()
+
+png(file.path(paths$out_dir, "heatmap_combined_genus.png"),
+    width = 10, height = 0.45 * length(heatmap_genera) + 2.5,
+    units = "in", res = 300)
+draw(ht_genus, merge_legend = TRUE)
+dev.off()
+
+cat("Saved: heatmap_combined_genus.[svg|png]\n")
+draw(ht_genus, merge_legend = TRUE)
+```
+
+```{r}
+# §15 — Save combined state -------------------------------------------
+saveRDS(
+  list(
+    combo_genus      = combo_genus,
+    path_combo       = path_combo,
+    md_combo         = md_combo,
+    # §13 results
+    m3_res           = m3_res,         ld_res           = ld_res,           ax_res           = ax_res,
+    m3_path_res      = m3_path_res,    ld_path_res      = ld_path_res,      ax_path_res      = ax_path_res,
+    # §13.5a verification table
+    verif_genus      = verif_genus,
+    # §11 / §12 outputs
+    alpha_combo_summary = summary_tab,
+    beta_aitch       = beta_aitch,     beta_bray        = beta_bray
+  ),
+  file.path(paths$out_dir, "metagenomics_combined_state.rds")
+)
+cat("Saved: metagenomics_combined_state.rds\n")
+```
+
