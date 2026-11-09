@@ -45,7 +45,7 @@ date-released: "2026-11-09"
 # Zenodo DOI is reserved. Zenodo reads this file, so leaving them out means the
 # archived record carries no link back here.
 repository-code: "https://github.com/liorlobel/icb-melanoma-metaproteomics"
-# doi: "10.5281/zenodo.XXXXXXX"
+doi: "10.5281/zenodo.24092524"
 identifiers:
   - type: other
     value: "PRJNA1558570"
