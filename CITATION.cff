@@ -36,6 +36,7 @@ authors:
     given-names: "Giorgio"
   - family-names: "Lobel"
     given-names: "Lior"
+    orcid: "https://orcid.org/0000-0001-9146-5839"
     affiliation: "The Mina and Everard Goodman Faculty of Life Sciences, Bar-Ilan University, Ramat Gan, Israel"
 keywords:
   - metaproteomics
@@ -92,3 +93,4 @@ preferred-citation:
       given-names: "Giorgio"
     - family-names: "Lobel"
       given-names: "Lior"
+      orcid: "https://orcid.org/0000-0001-9146-5839"
