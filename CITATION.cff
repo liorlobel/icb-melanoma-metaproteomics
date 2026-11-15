@@ -14,6 +14,10 @@ authors:
     given-names: "Moran"
   - family-names: "Rodrigues"
     given-names: "Richard"
+  - family-names: "McCulloch"
+    given-names: "John A."
+  - family-names: "Fernandes"
+    given-names: "Miriam R."
   - family-names: "Shapira-Frommer"
     given-names: "Ronnie"
   - family-names: "Boursi"
@@ -39,8 +43,8 @@ keywords:
   - gut microbiome
   - immune checkpoint blockade
   - melanoma
-version: "1.0.0"
-date-released: "2026-11-09"
+version: "1.0.1"
+date-released: "2026-11-15"
 # repository-code and doi are filled in when the repository is created and the
 # Zenodo DOI is reserved. Zenodo reads this file, so leaving them out means the
 # archived record carries no link back here.
@@ -66,6 +70,10 @@ preferred-citation:
       given-names: "Moran"
     - family-names: "Rodrigues"
       given-names: "Richard"
+    - family-names: "McCulloch"
+      given-names: "John A."
+    - family-names: "Fernandes"
+      given-names: "Miriam R."
     - family-names: "Shapira-Frommer"
       given-names: "Ronnie"
     - family-names: "Boursi"
