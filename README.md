@@ -323,7 +323,8 @@ Every section, amendment, withdrawal and decision rule is as written.
 
 | | |
 |---|---|
-| Metagenomes | NCBI SRA **PRJNA1558570** |
+| Metagenomes, Sheba cohort | NCBI SRA **PRJNA1558570** |
+| Metagenomes, Pittsburgh cohort | NCBI SRA, deposited separately by the NCI |
 | Metaproteomes | PRIDE **PXD086916** |
 
 ## Citation

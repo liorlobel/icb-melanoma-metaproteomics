@@ -8,14 +8,17 @@ near-twin that silently yields different numbers.
 
 | layer | repository | accession |
 |---|---|---|
-| Metagenomes (host-depleted paired FASTQ) | NCBI SRA | **PRJNA1558570** |
+| Metagenomes, Sheba cohort (host-depleted paired FASTQ) | NCBI SRA | **PRJNA1558570** |
+| Metagenomes, Pittsburgh cohort | NCBI SRA, deposited by the NCI | separate BioProject |
 | Metaproteomes (RAW, search results, SDRF) | PRIDE / ProteomeXchange | **PXD086916** |
 
-The SRA deposit holds 132 libraries — 82 Pittsburgh, 50 Sheba — which is
-broader than the analysed sets. It includes on-treatment and repeat libraries,
-libraries below the sequencing-depth threshold, and four Sheba libraries whose
-preparation failed; those four carry a per-library note in the deposit's own
-metadata. See the paper's Data availability statement.
+The SRA deposit holds 50 Sheba libraries, which is broader than the analysed
+set. It includes on-treatment and repeat libraries, libraries below the
+sequencing-depth threshold, and four libraries whose preparation failed; those
+four carry a per-library note in the deposit's own metadata. The Pittsburgh
+metagenomes were generated at the National Cancer Institute and are deposited
+there separately, under their own BioProject. See the paper's Data
+availability statement.
 
 ## Derived inputs the code expects
 
